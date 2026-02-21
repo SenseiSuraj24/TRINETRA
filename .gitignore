@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Large dataset CSVs (too big for GitHub)
+CSV's/
+*.csv
+
+# Saved models (binary, large)
+saved_models/*.pth
+saved_models/*.joblib
+
+# Logs (runtime generated)
+logs/
+
+# Temp / IDE
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Windows
+Thumbs.db
+Desktop.ini
