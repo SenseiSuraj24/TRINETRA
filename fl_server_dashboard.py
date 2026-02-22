@@ -132,7 +132,7 @@ st.markdown(f"""
 
 _ORGS = [
     {"id": "org_hospital_1",    "label": "Hospital",    "net": "192.168.1.0/24",  "role": "Normal"},
-    {"id": "org_bank_2",        "label": "Bank",        "net": "10.0.1.0/24",     "role": "Byzantine"},
+    {"id": "org_bank_2",        "label": "Bank",        "net": "10.0.1.0/24",     "role": "Normal"},
     {"id": "org_university_3",  "label": "University",  "net": "172.16.1.0/24",   "role": "Normal"},
 ]
 
@@ -474,11 +474,20 @@ def _render_clients(card_phs):
         "dropped":  ("✗ Dropped",       THEME["red"],    "dropped"),
         "offline":  ("⏸ Not Ready",     THEME["dim"],    "idle"),
     }
+    # Resolve Byzantine dynamically from Krum result, not from static _ORGS
+    _krum_byz   = st.session_state.get("byzantine_org")
+    _org_key_of = {
+        "org_hospital_1":   "hospital",
+        "org_bank_2":       "bank",
+        "org_university_3": "university",
+    }
     for i, org in enumerate(_ORGS):
         c    = cards[org["id"]]
         raw  = c.get("status", "idle")
         lbl, color, css = status_label.get(raw, ("Idle", THEME["dim"], "idle"))
-        role_color = THEME["orange"] if org["role"] == "Byzantine" else THEME["green"]
+        is_byz     = bool(_krum_byz and _krum_byz == _org_key_of[org["id"]])
+        role_label = "⚠ Krum-flagged" if is_byz else "✓ Normal"
+        role_color = THEME["orange"] if is_byz else THEME["green"]
         vfy = c.get("verified")
         vfy_html = ""
         _vfy_grn = THEME["green"]
@@ -488,8 +497,6 @@ def _render_clients(card_phs):
         elif vfy is False:
             vfy_html = f"<div style='color:{_vfy_red}; font-size:0.8em'>&#9939; Hash MISMATCH &#10007;</div>"
 
-        ip_map = {"Normal": "✓ Normal", "Byzantine": "⚠ Byzantine"}
-
         card_phs[i].markdown(
             f"<div class='client-card {css}'>"
             f"<div style='font-size:1.0em; font-weight:bold; color:{THEME['cyan']}'>"
@@ -497,7 +504,7 @@ def _render_clients(card_phs):
             f"<div style='font-size:0.77em; color:{THEME['dim']}'>{org['id']}</div>"
             f"<div style='font-size:0.77em; color:{THEME['dim']}'>🌐 {org['net']}</div>"
             f"<div style='font-size:0.78em; color:{role_color}; margin-top:2px'>"
-            f"{ip_map[org['role']]}</div>"
+            f"{role_label}</div>"
             f"<div style='font-size:0.85em; color:{color}; margin-top:4px'>"
             f"<b>{lbl}</b></div>"
             f"{vfy_html}"
