@@ -157,8 +157,10 @@ def krum_aggregate(
 
     Shape preservation:  each result array has the same shape as input arrays.
     """
+    # Cast to float32: keeps dtype consistent with PyTorch model weights so
+    # SHA-256 hashes computed before and after Flower serialization always match.
     return [
-        np.mean([update[i] for update in selected_updates], axis=0)
+        np.mean([update[i] for update in selected_updates], axis=0).astype(np.float32)
         for i in range(len(selected_updates[0]))
     ]
 
@@ -425,21 +427,32 @@ def start_server(blockchain_module=None) -> None:
 # Simulation Mode (no real gRPC) — for demo without network setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> List[dict]:
+def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
+                              active_orgs: list = None) -> List[dict]:
     """
     In-process federation simulation for the hackathon demo.
 
-    Bypasses Flower's gRPC transport and runs the full Krum aggregation +
-    blockchain logging sequence in-process — no ports needed, works offline.
-
-    Returns a list of round result dicts for the dashboard to display.
+    Parameters
+    ----------
+    active_orgs : list of org keys that are ready, e.g. ["hospital","university"].
+                  If None, defaults to all three.  Only ready orgs participate.
+                  Byzantine client is randomly assigned among them each run.
     """
     from aura.fl_client import create_mock_clients
 
     if n_rounds is None:
         n_rounds = cfg.FL_NUM_ROUNDS
 
-    clients  = create_mock_clients(n_clients=3, n_samples=300)
+    if active_orgs is None:
+        active_orgs = ["hospital", "bank", "university"]
+
+    # No pre-assigned Byzantine — Krum detects the outlier during aggregation.
+    clients, _ = create_mock_clients(
+        n_clients     = len(active_orgs),
+        n_samples     = 300,
+        org_ids       = active_orgs,
+        attack_client = -1,
+    )
     strategy = KrumFedAURA(blockchain_module=blockchain_module,
                            num_rounds=n_rounds)
 
@@ -475,18 +488,25 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
             failures     = [],
         )
         # Build per-client status for dashboard display
+        # "Byzantine" = whoever Krum DROPPED (mathematical outlier detection)
         selected_idx = metrics.get('krum_selected_indices', [])
+        dropped_idx  = [i for i in range(len(clients)) if i not in selected_idx]
         client_statuses = []
         for i, client in enumerate(clients):
-            is_selected = (selected_idx and i in selected_idx)
-            is_byzantine = (i == 1)   # index 1 is always the adversarial client
+            is_selected  = (selected_idx and i in selected_idx)
+            is_byzantine = (i in dropped_idx)   # dropped by Krum = suspicious
+            org_key      = active_orgs[i] if i < len(active_orgs) else f"org_{i}"
+            net_map      = {"hospital": "192.168.1.0/24",
+                            "bank":     "10.0.1.0/24",
+                            "university": "172.16.1.0/24"}
             client_statuses.append({
-                "client_id":  client.client_id,
-                "network":    ["192.168.1.0/24", "10.0.1.0/24", "172.16.1.0/24"][i],
-                "org":        ["Hospital", "Bank", "University"][i],
-                "role":       "Byzantine" if is_byzantine else "Normal",
-                "selected":   is_selected if selected_idx else (not is_byzantine),
-                "round":      rnd,
+                "client_id": client.client_id,
+                "org_id":    org_key,
+                "network":   net_map.get(org_key, "—"),
+                "org":       org_key.capitalize(),
+                "role":      "Byzantine" if is_byzantine else "Normal",
+                "selected":  is_selected if selected_idx else (not is_byzantine),
+                "round":     rnd,
             })
         if new_params is not None:
             global_params = parameters_to_ndarrays(new_params)

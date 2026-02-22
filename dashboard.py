@@ -51,9 +51,9 @@ from aura.blockchain import AURABlockchainLogger
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ORG_PROFILES = {
-    "hospital":   {"label": "Hospital",    "id": "org_hospital_1",   "net": "192.168.1.0/24",  "icon": "🏥", "role": "Normal",    "color": "#00ff88"},
-    "bank":       {"label": "Bank",        "id": "org_bank_2",       "net": "10.0.1.0/24",    "icon": "🏦", "role": "Byzantine", "color": "#ff8800"},
-    "university": {"label": "University",  "id": "org_university_3", "net": "172.16.1.0/24",  "icon": "🎓", "role": "Normal",    "color": "#4488ff"},
+    "hospital":   {"label": "Hospital",    "id": "org_hospital_1",   "net": "192.168.1.0/24",  "icon": "🏥", "role": "Normal", "color": "#00ff88"},
+    "bank":       {"label": "Bank",        "id": "org_bank_2",       "net": "10.0.1.0/24",    "icon": "🏦", "role": "Normal", "color": "#388bfd"},
+    "university": {"label": "University",  "id": "org_university_3", "net": "172.16.1.0/24",  "icon": "🎓", "role": "Normal", "color": "#4488ff"},
 }
 _ORG_KEY  = os.environ.get("AURA_ORG_ID", "").lower().strip()
 ORG       = _ORG_PROFILES.get(_ORG_KEY)   # None if not set
@@ -142,6 +142,15 @@ def _init_state():
         "fl_client_status": [],     # Per-client metadata from latest FL round
         "fl_ready":         False,  # Whether this org node has signalled FL readiness
     }
+    # Sync readiness from shared file if this is an org node
+    if ORG and "fl_ready" not in st.session_state:
+        _rf = Path(cfg.LOGS_DIR) / "fl_readiness.json"
+        if _rf.exists():
+            try:
+                _rd = json.loads(_rf.read_text())
+                defaults["fl_ready"] = _rd.get(_ORG_KEY, {}).get("ready", False)
+            except Exception:
+                pass
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -768,7 +777,22 @@ with ctrl_fl:
 
     _toggle_label = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
     if st.button(_toggle_label, use_container_width=True):
-        st.session_state["fl_ready"] = not _ready
+        new_ready = not _ready
+        st.session_state["fl_ready"] = new_ready
+        # Write to shared readiness file so FL Server Console can see it
+        if ORG:
+            import json as _json
+            _rf = Path(cfg.LOGS_DIR) / "fl_readiness.json"
+            _rf.parent.mkdir(parents=True, exist_ok=True)
+            _rd: dict = {}
+            if _rf.exists():
+                try:
+                    _rd = _json.loads(_rf.read_text())
+                except Exception:
+                    _rd = {}
+            _rd[_ORG_KEY] = {"ready": new_ready, "org": ORG["label"],
+                              "net": ORG["net"], "ts": time.time()}
+            _rf.write_text(_json.dumps(_rd, indent=2))
         st.rerun()
 
     # ── Client Status Table ──────────────────────────────────────────────────

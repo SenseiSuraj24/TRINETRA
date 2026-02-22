@@ -213,39 +213,56 @@ def create_mock_clients(
     n_clients:    int   = 3,
     n_samples:    int   = 500,
     feature_dim:  int   = cfg.FEATURE_DIM,
-    attack_client: int  = 1,     # This client injects "attack-pattern" data
-) -> List[AURAFlowerClient]:
+    attack_client: int  = -1,     # -1 = no forced attack (Krum detects real outliers)
+    org_ids:      list  = None,   # Override org IDs e.g. ["hospital","university"]
+) -> List["AURAFlowerClient"]:
     """
     Factory function for hackathon demo.
 
     Creates N mock clients with synthetic Gaussian flow data.
-    One client (attack_client index) has their data slightly perturbed
-    to simulate a network under attack — their local model will learn
-    this attack pattern and share the fingerprint via federation.
-    """
-    clients = []
-    for i in range(n_clients):
-        client_id = f"org_{['hospital', 'bank', 'university'][i % 3]}_{i + 1}"
+    By default NO client is pre-labelled as Byzantine (attack_client=-1).
+    If you explicitly pass an index, that client's data will be poisoned
+    to simulate a detected attack scenario.
 
-        # Base data: Normal traffic — centred at 0.5 in normalised feature space
+    Byzantine detection is performed server-side by Krum: whichever client
+    is DROPPED by Krum is reported as the suspicious/outlier node.  This
+    means Byzantine is never pre-assigned at random — it is determined
+    purely by the mathematical outlier detection in the aggregation step.
+
+    Parameters
+    ----------
+    attack_client : Index of the client to poison.
+                    -1  → all clients train honestly (default)
+                    0-N → explicitly poison that client index
+    org_ids       : Optional list of org keys ["hospital","bank","university"]
+                    overriding the default 3-client set.  Length must match n_clients.
+    """
+    _default_orgs = ["hospital", "bank", "university"]
+    if org_ids is None:
+        org_ids = _default_orgs[:n_clients]
+
+    if attack_client == -1:
+        attack_client = None   # all clients honest
+
+    clients = []
+    for i, org_key in enumerate(org_ids):
+        client_id = f"org_{org_key}_1"
+
+        # Base data: Normal traffic
         train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
 
         if i == attack_client:
-            # Inject 20% attack-like samples: bimodal distribution with
-            # extreme values in specific feature dimensions (e.g., byte ratios)
             n_attack = n_samples // 5
             attack_rows = torch.rand(n_attack, feature_dim)
-            # DDoS-like: extreme packet rates in dims [2, 3, 15]
             attack_rows[:, [2, 3, 15]] = torch.rand(n_attack, 3) * 0.3 + 0.7
-            # Exfil-like: abnormal byte transfer in dims [4, 5, 63]
             attack_rows[:, [4, 5, 63]] = torch.rand(n_attack, 3) * 0.2 + 0.8
             train_data[:n_attack] = attack_rows
-            logger.info(f"[{client_id}] Attack simulation injected into training data.")
+            logger.info(f"[{client_id}] Attack simulation injected (Byzantine).")
 
         val_data = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
         clients.append(AURAFlowerClient(client_id, train_data, val_data))
 
-    return clients
+    return clients, attack_client   # return who was selected as Byzantine
 
 
 # ─────────────────────────────────────────────────────────────────────────────

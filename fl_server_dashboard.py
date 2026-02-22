@@ -11,6 +11,7 @@ Dedicated server-side console showing:
 """
 
 import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,17 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
+
+_READINESS_FILE = Path(cfg.LOGS_DIR) / "fl_readiness.json"
+
+def _read_readiness() -> dict:
+    """Return {org_key: {ready, org, net, ts}} from shared file."""
+    if not _READINESS_FILE.exists():
+        return {}
+    try:
+        return json.loads(_READINESS_FILE.read_text())
+    except Exception:
+        return {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Theme
@@ -150,6 +162,8 @@ def _init():
         "global_hash":      None,
         "global_version":   None,
         "verify_results":   {},   # org_id → True/False
+        "byzantine_org":    None,  # which org was dynamically identified as Byzantine
+        "active_orgs":      [],    # orgs that participated in the last FL run
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -183,6 +197,19 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, FitIns
     import numpy as np
 
+    # ── Determine active orgs from shared readiness file ────────────────────────
+    readiness = _read_readiness()
+    all_org_keys = ["hospital", "bank", "university"]
+    active_orgs = [k for k in all_org_keys
+                   if readiness.get(k, {}).get("ready", False)]
+    # Fall back to all 3 if no readiness data exists (demo mode)
+    if not active_orgs:
+        active_orgs = all_org_keys
+        _log("No readiness data found — using all 3 orgs (demo mode)")
+    else:
+        inactive = [k for k in all_org_keys if k not in active_orgs]
+        _log(f"Active: {active_orgs}  |  Inactive (excluded): {inactive if inactive else 'none'}")
+
     st.session_state["fl_running"]    = True
     st.session_state["fl_done"]       = False
     st.session_state["round_results"] = []
@@ -199,16 +226,25 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             "status": "idle", "round": 0, "selected": None, "verified": None,
         }
 
-    n_rounds = cfg.FL_NUM_ROUNDS
-    st.session_state["total_rounds"] = n_rounds
-
     # Use real blockchain logger so the hash is written to blockchain_fallback.jsonl
     # and verify_chain.py can cross-check it against hash_registry.json
     from aura.blockchain import AURABlockchainLogger
     bc_module = AURABlockchainLogger()
 
-    # Build real clients + strategy (mirrors run_federation_simulation)
-    clients  = create_mock_clients(n_clients=3, n_samples=300)
+    n_rounds = cfg.FL_NUM_ROUNDS
+    st.session_state["total_rounds"] = n_rounds
+    st.session_state["active_orgs"]  = active_orgs
+
+    # Build clients for ready orgs only — all train honestly.
+    # Byzantine is NOT pre-assigned; Krum will detect the outlier during aggregation.
+    clients, _ = create_mock_clients(
+        n_clients     = len(active_orgs),
+        n_samples     = 300,
+        org_ids       = active_orgs,
+        attack_client = -1,
+    )
+    st.session_state["byzantine_org"] = None   # will be set by Krum detection
+
     strategy = KrumFedAURA(blockchain_module=bc_module, num_rounds=n_rounds)
 
     global_model  = MB()
@@ -224,9 +260,14 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         # ── STEP 0: Collect Weights ───────────────────────────────────────
         _set_pipe(0, "active"); _render_pipe(pipe_ph); _render_clients(card_placeholders)
 
+        _org_meta = {o["id"]: o for o in _ORGS}   # lookup by id
         fit_results = []
         for i, client in enumerate(clients):
-            org_id = _ORGS[i]["id"]
+            org_key   = active_orgs[i]
+            org_info  = _org_meta.get(f"org_{org_key}_1") or next(
+                (o for o in _ORGS if org_key in o["id"]), _ORGS[0])
+            org_label = org_info["label"]
+            org_id    = org_info["id"]
             st.session_state["client_cards"][org_id]["status"] = "sending"
             st.session_state["client_cards"][org_id]["round"]  = rnd
             _render_clients(card_placeholders)
@@ -239,7 +280,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             fit_results.append((None, fit_res))
             raw_loss = fit_res.metrics.get('train_loss', None)
             loss_str = f"{raw_loss:.4f}" if isinstance(raw_loss, (int, float)) else str(raw_loss)
-            _log(f"  [{_ORGS[i]['label']}] Weights received — loss={loss_str}")
+            _log(f"  [{org_label}] Weights received — loss={loss_str}")
 
         time.sleep(0.35)
         _set_pipe(0, "done")
@@ -282,15 +323,28 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             "dropped":  dropped_indices,
         })
 
+        # Set byzantine_org from whoever Krum DROPPED (outlier = suspicious node)
+        if dropped_indices:
+            krum_byz_org = active_orgs[dropped_indices[0]]
+            st.session_state["byzantine_org"] = krum_byz_org
+        else:
+            krum_byz_org = None
+
         for i, org in enumerate(_ORGS):
-            is_sel = i in selected_indices
-            st.session_state["client_cards"][org["id"]]["status"]   = "selected" if is_sel else "dropped"
+            org_key = org["id"].replace("org_", "").replace("_1","")
+            is_act  = org_key in active_orgs
+            act_idx = active_orgs.index(org_key) if is_act else None
+            is_sel  = is_act and (act_idx in selected_indices)
+            is_byz  = is_act and (act_idx is not None) and (act_idx in dropped_indices)
+            st.session_state["client_cards"][org["id"]]["status"]   = (
+                "selected" if is_sel else ("dropped" if is_act else "offline"))
             st.session_state["client_cards"][org["id"]]["selected"] = is_sel
         _render_clients(card_placeholders)
 
-        sel_labels  = [_ORGS[i]["label"] for i in selected_indices]
-        drop_labels = [_ORGS[i]["label"] for i in dropped_indices]
-        _log(f"  [KRUM] Selected: {sel_labels}  |  Dropped: {drop_labels}")
+        sel_labels  = [active_orgs[i].capitalize() for i in selected_indices]
+        drop_labels = [active_orgs[i].capitalize() for i in dropped_indices]
+        byz_note    = f" ⚡ Krum flagged {krum_byz_org.upper()} as suspicious" if krum_byz_org else " ✓ no outlier detected"
+        _log(f"  [KRUM] Selected: {sel_labels}  |  Dropped: {drop_labels}{byz_note}")
         _log(f"  [KRUM] Scores → {['%.1f' % s for s in scores]}")
 
         model_version = metrics.get("model_version", f"v{rnd}.{rnd}")
@@ -337,11 +391,14 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         if is_final:
             client_received_hash = hash_model_weights(global_params)
             for i, org in enumerate(_ORGS):
+                org_key = org["id"].replace("org_","").replace("_1","")
+                if org_key not in active_orgs:
+                    continue
                 match = (client_received_hash == model_hash)
                 st.session_state["verify_results"][org["id"]] = match
                 st.session_state["client_cards"][org["id"]]["verified"] = match
                 status = "✓ MATCH — deployed" if match else "✗ MISMATCH — rejected"
-                _log(f"  [{_ORGS[i]['label']}] Verify: {status}")
+                _log(f"  [{org['label']}] Verify: {status}")
             _render_clients(card_placeholders)
         else:
             _log(f"  [CLIENTS] Round {rnd} model received. "
@@ -411,10 +468,11 @@ def _render_pipe(ph):
 def _render_clients(card_phs):
     cards = st.session_state["client_cards"]
     status_label = {
-        "idle":     ("Idle",          THEME["dim"],   "idle"),
-        "sending":  ("Sending…",      THEME["yellow"], "idle"),
-        "selected": ("✓ Selected",    THEME["green"],  "selected"),
-        "dropped":  ("✗ Dropped",     THEME["red"],    "dropped"),
+        "idle":     ("Idle",            THEME["dim"],    "idle"),
+        "sending":  ("Sending…",        THEME["yellow"], "idle"),
+        "selected": ("✓ Selected",      THEME["green"],  "selected"),
+        "dropped":  ("✗ Dropped",       THEME["red"],    "dropped"),
+        "offline":  ("⏸ Not Ready",     THEME["dim"],    "idle"),
     }
     for i, org in enumerate(_ORGS):
         c    = cards[org["id"]]
@@ -603,6 +661,55 @@ with metrics_ph.container():
     c2.metric("Krum Selected", "— / 3")
     c3.metric("Krum Dropped",  "—")
     c4.metric("Status",        run_state)
+
+st.markdown("---")
+
+# ── Live Org Readiness Panel ──────────────────────────────────────────────────
+_readiness_hdr_col, _readiness_btn_col = st.columns([4, 1])
+with _readiness_hdr_col:
+    st.markdown(
+        f"<h4 style='color:{THEME['green']}'>📡 Org Node Readiness</h4>",
+        unsafe_allow_html=True,
+    )
+with _readiness_btn_col:
+    st.button("🔄 Refresh", key="_refresh_readiness", use_container_width=True)
+
+_ORG_ICONS = {"hospital": "🏥", "bank": "🏦", "university": "🎓"}
+_readiness_data = _read_readiness()
+_byz_last = st.session_state.get("byzantine_org")
+_rd_cols = st.columns(3)
+for _ri, _org_k in enumerate(["hospital", "bank", "university"]):
+    _info = _readiness_data.get(_org_k, {})
+    _ready = _info.get("ready", False)
+    _icon = _ORG_ICONS[_org_k]
+    _label = _org_k.capitalize()
+    _pill_color = THEME["green"] if _ready else THEME["red"]
+    _pill_text  = "🟢 READY" if _ready else "🔴 NOT READY"
+    _byz_badge  = (
+        f"<span style='background:{THEME['yellow']};color:#000;border-radius:4px;"
+        f"padding:1px 6px;font-size:0.75em;margin-left:6px;'>⚡ Krum-flagged</span>"
+        if _byz_last == _org_k else ""
+    )
+    _net = _info.get("net", "—")
+    with _rd_cols[_ri]:
+        st.markdown(
+            f"<div style='border:1px solid {_pill_color};border-radius:8px;"
+            f"padding:10px 14px;background:{THEME['panel']};margin-bottom:8px'>"
+            f"<b style='font-size:1.05em'>{_icon} {_label}</b>{_byz_badge}<br>"
+            f"<span style='color:{_pill_color};font-weight:600'>{_pill_text}</span><br>"
+            f"<span style='color:{THEME['dim']};font-size:0.78em'>{_net}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+if _byz_last:
+    st.markdown(
+        f"<div style='color:{THEME['yellow']};font-size:0.85em;margin-bottom:8px'>"
+        f"⚡ Krum-flagged suspicious node last run: <b>{_byz_last.upper()}</b>"
+        f" — this client's update was a mathematical outlier and was dropped by aggregation."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 st.markdown("---")
 
