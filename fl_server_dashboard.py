@@ -285,7 +285,15 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     else:
         _log("\u2705 Bank is offline \u2014 all active orgs are honest this run")
 
-    strategy = KrumFedAURA(blockchain_module=bc_module, num_rounds=n_rounds)
+    # Pass the live client count so aggregate_fit's quorum check never
+    # abandons rounds when fewer than 3 orgs are active (e.g. one quarantined).
+    n_active = len(active_orgs)
+    strategy = KrumFedAURA(
+        blockchain_module      = bc_module,
+        num_rounds             = n_rounds,
+        min_fit_clients        = n_active,
+        min_available_clients  = n_active,
+    )
 
     global_model  = MB()
     global_params = [p.detach().cpu().numpy() for p in global_model.parameters()]

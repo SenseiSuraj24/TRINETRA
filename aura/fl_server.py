@@ -270,10 +270,15 @@ class KrumFedAURA(FedAvg):
                 f"(straggler drop policy applied).  Proceeding with {n_received} responses."
             )
 
-        if n_received < cfg.FL_MIN_CLIENTS:
+        # Use self.min_fit_clients so the quorum adapts when fewer orgs are
+        # active (e.g., one quarantined).  cfg.FL_MIN_CLIENTS is only the
+        # hard-coded default for standalone server runs; the dashboard always
+        # passes len(active_orgs) explicitly at strategy instantiation time.
+        min_needed = getattr(self, 'min_fit_clients', cfg.FL_MIN_CLIENTS)
+        if n_received < min_needed:
             logger.error(
                 f"{round_tag} Insufficient responses ({n_received} < "
-                f"{cfg.FL_MIN_CLIENTS}).  ABANDONING round — global model preserved."
+                f"{min_needed}).  ABANDONING round — global model preserved."
             )
             return None, {"status": "abandoned", "received": n_received}
 
