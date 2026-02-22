@@ -307,6 +307,11 @@ class KrumFedAURA(FedAvg):
             # Fallback: local hash file
             self._log_hash_local(model_version_tag, model_hash, server_round)
 
+        # ── Trusted Registry (ground-truth — separate from the ledger) ───────
+        # This file is written at aggregation time and acts as the
+        # tamper-detection reference in verify_chain.py.
+        self._write_trusted_registry(model_version_tag, model_hash)
+
         # Record in history (for dashboard display)
         self._hash_history.append({
             "round":   server_round,
@@ -338,6 +343,22 @@ class KrumFedAURA(FedAvg):
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
         logger.info(f"[LOCAL-HASH] {model_hash} written to {log_path}")
+
+    def _write_trusted_registry(self, version: str, model_hash: str) -> None:
+        """Write to the trusted hash registry (separate from the ledger).
+        verify_chain.py reads this as the ground-truth reference.
+        Corrupting the blockchain ledger won't affect this file.
+        """
+        registry_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
+        registry: dict = {}
+        if registry_path.exists():
+            try:
+                registry = json.loads(registry_path.read_text())
+            except Exception:
+                registry = {}
+        registry[version] = model_hash
+        registry_path.write_text(json.dumps(registry, indent=2))
+        logger.info(f"[REGISTRY] {version} written to trusted registry.")
 
     def _save_model(self, arrays: List[np.ndarray], version_tag: str) -> None:
         """Save the aggregated global model weights to disk."""
