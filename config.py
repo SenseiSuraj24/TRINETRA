@@ -98,7 +98,7 @@ EMA_WARMUP_BATCHES = 50
 # ─────────────────────────────────────────────────────────────────────────────
 
 FL_SERVER_ADDRESS   = "localhost:8080"
-FL_NUM_ROUNDS       = 5
+FL_NUM_ROUNDS       = 3          # 3 rounds for 3 clients — 1 hash per round on ledger
 FL_MIN_CLIENTS      = 2          # Minimum clients needed to start a round
 FL_MIN_AVAILABLE    = 2
 
