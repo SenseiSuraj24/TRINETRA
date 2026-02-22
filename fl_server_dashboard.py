@@ -177,7 +177,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     Drive the FL simulation round-by-round, updating Streamlit placeholders
     at each pipeline step so the operator sees live progress.
     """
-    from aura.fl_server import hash_model_weights, krum_select, krum_aggregate, KrumFedAURA
+    from aura.fl_server import hash_model_weights, KrumFedAURA
     from aura.fl_client import create_mock_clients
     from aura.models import AURAModelBundle as MB
     from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, FitIns
@@ -202,9 +202,14 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     n_rounds = cfg.FL_NUM_ROUNDS
     st.session_state["total_rounds"] = n_rounds
 
+    # Use real blockchain logger so the hash is written to blockchain_fallback.jsonl
+    # and verify_chain.py can cross-check it against hash_registry.json
+    from aura.blockchain import AURABlockchainLogger
+    bc_module = AURABlockchainLogger()
+
     # Build real clients + strategy (mirrors run_federation_simulation)
     clients  = create_mock_clients(n_clients=3, n_samples=300)
-    strategy = KrumFedAURA(blockchain_module=None, num_rounds=n_rounds)
+    strategy = KrumFedAURA(blockchain_module=bc_module, num_rounds=n_rounds)
 
     global_model  = MB()
     global_params = [p.detach().cpu().numpy() for p in global_model.parameters()]
@@ -245,17 +250,30 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         client_updates = [parameters_to_ndarrays(r.parameters) for _, r in fit_results]
 
-        # Compute flat vectors + scores manually for display
+        # Compute Krum scores locally for display
         flat = [np.concatenate([p.flatten() for p in u]) for u in client_updates]
-        n, k = len(flat), max(1, len(flat) - cfg.KRUM_NUM_TO_SELECT - 2)
+        n_cl  = len(flat)
+        k_val = max(1, n_cl - cfg.KRUM_NUM_TO_SELECT - 2)
         scores = []
-        for i in range(n):
+        for i in range(n_cl):
             dists = sorted([float(np.sum((flat[i] - flat[j])**2))
-                            for j in range(n) if j != i])
-            scores.append(sum(dists[:k]))
+                            for j in range(n_cl) if j != i])
+            scores.append(sum(dists[:k_val]))
 
-        selected_indices = krum_select(client_updates, cfg.KRUM_NUM_TO_SELECT)
-        dropped_indices  = [i for i in range(n) if i not in selected_indices]
+        # ── STEP 2: Aggregate (+ blockchain mint on final round) ──────────
+        _set_pipe(1, "done")
+        _set_pipe(2, "active"); _render_pipe(pipe_ph)
+
+        # Route through strategy.aggregate_fit — this handles Krum, hash,
+        # blockchain mint (bc_module) and registry write all in one call
+        new_params, metrics = strategy.aggregate_fit(
+            server_round = rnd,
+            results      = fit_results,
+            failures     = [],
+        )
+
+        selected_indices = metrics.get("krum_selected_indices", [])
+        dropped_indices  = [i for i in range(n_cl) if i not in selected_indices]
 
         st.session_state["krum_scores_hist"].append({
             "round":    rnd,
@@ -270,20 +288,19 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             st.session_state["client_cards"][org["id"]]["selected"] = is_sel
         _render_clients(card_placeholders)
 
-        sel_labels   = [_ORGS[i]["label"] for i in selected_indices]
-        drop_labels  = [_ORGS[i]["label"] for i in dropped_indices]
+        sel_labels  = [_ORGS[i]["label"] for i in selected_indices]
+        drop_labels = [_ORGS[i]["label"] for i in dropped_indices]
         _log(f"  [KRUM] Selected: {sel_labels}  |  Dropped: {drop_labels}")
-        _log(f"  [KRUM] Scores → {['%.1f'%s for s in scores]}")
-        time.sleep(0.35)
-        _set_pipe(1, "done")
+        _log(f"  [KRUM] Scores → {['%.1f' % s for s in scores]}")
 
-        # ── STEP 2: Aggregate ─────────────────────────────────────────────
-        _set_pipe(2, "active"); _render_pipe(pipe_ph)
-        selected_updates = [client_updates[i] for i in selected_indices]
-        aggregated       = krum_aggregate(selected_updates)
-        global_params    = aggregated
+        model_version = metrics.get("model_version", f"v{rnd}.{rnd}")
+        model_hash    = metrics.get("model_hash", "")
+        if new_params is not None:
+            global_params = parameters_to_ndarrays(new_params)
 
-        model_version = f"final_v{rnd}" if is_final else f"v{rnd}.{rnd}"
+        st.session_state["global_hash"]    = model_hash
+        st.session_state["global_version"] = model_version
+
         _log(f"  [SERVER] Global model {model_version} aggregated from "
              f"{len(selected_indices)} updates")
         time.sleep(0.3)
@@ -292,18 +309,8 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         # ── STEP 3: Mint Hash ─────────────────────────────────────────────
         _set_pipe(3, "active"); _render_pipe(pipe_ph)
 
-        model_hash = hash_model_weights(aggregated)
-        st.session_state["global_hash"]    = model_hash
-        st.session_state["global_version"] = model_version
-
         if is_final:
-            # Write to registry (mirrors fl_server logic)
-            from pathlib import Path
-            import json
-            reg_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
-            reg_path.parent.mkdir(parents=True, exist_ok=True)
-            reg_path.write_text(json.dumps({model_version: model_hash}, indent=2))
-
+            # aggregate_fit already minted hash + wrote registry via bc_module
             st.session_state["hash_ledger"].append({
                 "round": rnd, "version": model_version,
                 "hash":  model_hash, "time": time.strftime("%H:%M:%S"),
