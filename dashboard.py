@@ -840,6 +840,11 @@ with ctrl_fl:
             st.session_state["fl_ready"] = new_ready
             _write_readiness(new_ready, False)
             st.rerun()
+        if st.button("🚨 Report Under Attack — Quarantine", use_container_width=True):
+            st.session_state["under_attack"] = True
+            st.session_state["fl_ready"]     = False
+            _write_readiness(False, True)
+            st.rerun()
 
     # ── Client Status Table ──────────────────────────────────────────────────
     clients_info = st.session_state.get("fl_client_status", [])

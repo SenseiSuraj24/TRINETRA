@@ -283,18 +283,12 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         _qid = {"hospital": "org_hospital_1", "bank": "org_bank_2", "university": "org_university_3"}[_qk]
         st.session_state["client_cards"][_qid]["status"] = "quarantined"
 
-    # ── Randomly inject attack into one active org so Krum has a real signal ───
-    # Every FL run the server secretly poisons one participating org's training
-    # data. Krum's job is to detect the outlier and drop it. The chosen org is
-    # random each run so no org is always flagged. After detection the server
-    # auto-quarantines that org via _write_readiness_server.
-    import random as _rand
-    if len(active_orgs) >= 2:
-        attack_org        = _rand.choice(active_orgs)
-        attack_client_arg = active_orgs.index(attack_org)
-    else:
-        attack_org        = None
-        attack_client_arg = -1   # only 1 org — nothing to compare, skip attack
+    # All orgs participate honestly by default — no attack injected.
+    # Attack injection only happens when triggered externally (future feature).
+    # Krum will still run and may drop the statistical outlier due to random
+    # weight init variance, but honest orgs are never auto-quarantined.
+    attack_org        = None
+    attack_client_arg = -1   # -1 = all honest
 
     clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
@@ -304,11 +298,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     )
     st.session_state["byzantine_org"] = None
     st.session_state["attack_idx"]    = attack_idx
-    if attack_org:
-        _log(f"\U0001f9a0 [SERVER] Attack data secretly injected into: {attack_org.upper()} "
-             f"\u2014 Krum will attempt to identify and drop this outlier")
-    else:
-        _log("\u2705 Single active org \u2014 skipping attack injection this run")
+    _log("\u2705 All active orgs sending honest data this run")
 
     # Pass the live client count so aggregate_fit's quorum check never
     # abandons rounds when fewer than 3 orgs are active (e.g. one quarantined).
@@ -404,18 +394,16 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             krum_byz_org = None
 
         # ── Server AI Auto-Quarantine ─────────────────────────────────────
-        # Krum detected an outlier → server immediately writes under_attack=True
-        # back to fl_readiness.json.  The org's own dashboard will pick this up
-        # on its next render cycle — no manual "Report Under Attack" needed.
-        if krum_byz_org and krum_byz_org not in quarantined:
+        # Only quarantine when attack data was ACTUALLY injected AND Krum
+        # caught exactly that client. Never quarantine on honest-noise drops.
+        _atk_idx     = st.session_state.get("attack_idx")
+        _atk_injected = (_atk_idx is not None and isinstance(_atk_idx, int) and _atk_idx >= 0)
+        krum_accurate = _atk_injected and (_atk_idx in dropped_indices)
+        if krum_accurate and krum_byz_org and krum_byz_org not in quarantined:
             _write_readiness_server(krum_byz_org, under_attack=True)
-            _log(f"  [SERVER-AI] ⚡ Auto-quarantined {krum_byz_org.upper()} "
-                 f"— Krum flagged Byzantine behaviour. "
-                 f"Org is blocked from next FL run until attack ends.")
-
-        # Did Krum correctly catch the poisoned client?
-        _atk_idx = st.session_state.get("attack_idx")
-        krum_accurate = (_atk_idx is not None and _atk_idx in dropped_indices)
+            _log(f"  [SERVER-AI] \u26a1 Auto-quarantined {krum_byz_org.upper()} "
+                 f"\u2014 Krum confirmed Byzantine update. "
+                 f"Org blocked from next FL run until issue resolved.")
 
         for i, org in enumerate(_ORGS):
             org_key = _ORG_ID_TO_KEY.get(org["id"], org["id"])
