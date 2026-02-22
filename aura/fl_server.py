@@ -173,13 +173,13 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
     """
     Compute a SHA-256 hash over the concatenated model weight bytes.
 
-    This hash is the "fingerprint" written to the blockchain smart contract.
-    Any tampering with even a single weight bit changes the hash completely
-    (avalanche effect), making model poisoning after aggregation detectable.
+    Normalises every array to C-contiguous float32 before hashing so the
+    result is identical whether called on the server-side aggregated arrays
+    or on the client-side after Flower's ndarrays_to_parameters round-trip.
     """
     h = hashlib.sha256()
     for arr in arrays:
-        h.update(arr.tobytes())
+        h.update(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
     return "0x" + h.hexdigest()
 
 
@@ -446,12 +446,15 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
     if active_orgs is None:
         active_orgs = ["hospital", "bank", "university"]
 
-    # No pre-assigned Byzantine — Krum detects the outlier during aggregation.
-    clients, _ = create_mock_clients(
+    # Inject real attack data into one randomly-chosen client so Krum has a
+    # genuine outlier to detect (not all-honest → meaningless Krum drop).
+    # The returned attack_idx tells us which org was poisoned; after aggregation
+    # we verify whether Krum correctly identified and dropped that client.
+    clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
         n_samples     = 300,
         org_ids       = active_orgs,
-        attack_client = -1,
+        attack_client = None,   # None = randomly poison one client
     )
     strategy = KrumFedAURA(blockchain_module=blockchain_module,
                            num_rounds=n_rounds)

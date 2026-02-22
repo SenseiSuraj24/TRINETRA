@@ -162,7 +162,8 @@ def _init():
         "global_hash":      None,
         "global_version":   None,
         "verify_results":   {},   # org_id → True/False
-        "byzantine_org":    None,  # which org was dynamically identified as Byzantine
+        "byzantine_org":    None,  # org key Krum dropped (detected outlier)
+        "attack_idx":       None,  # index of client with injected attack data
         "active_orgs":      [],    # orgs that participated in the last FL run
     }
     for k, v in defaults.items():
@@ -235,15 +236,20 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     st.session_state["total_rounds"] = n_rounds
     st.session_state["active_orgs"]  = active_orgs
 
-    # Build clients for ready orgs only — all train honestly.
-    # Byzantine is NOT pre-assigned; Krum will detect the outlier during aggregation.
-    clients, _ = create_mock_clients(
+    # Inject real attack data into one random org so Krum has a genuine outlier.
+    # attack_idx is which client index was poisoned — used later to check if
+    # Krum correctly detected them (for demo accuracy display).
+    clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
         n_samples     = 300,
         org_ids       = active_orgs,
-        attack_client = -1,
+        attack_client = None,   # None = randomly inject attack into one org
     )
-    st.session_state["byzantine_org"] = None   # will be set by Krum detection
+    st.session_state["byzantine_org"]  = None   # will be set after Krum runs
+    st.session_state["attack_idx"]     = attack_idx  # poisoned client index
+    attack_org = active_orgs[attack_idx] if attack_idx is not None else None
+    _log(f"🦠 Attack data injected into: {attack_org.upper() if attack_org else 'none'} "
+         f"— Krum will now attempt to detect this outlier")
 
     strategy = KrumFedAURA(blockchain_module=bc_module, num_rounds=n_rounds)
 
@@ -330,6 +336,10 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         else:
             krum_byz_org = None
 
+        # Did Krum correctly catch the poisoned client?
+        _atk_idx = st.session_state.get("attack_idx")
+        krum_accurate = (_atk_idx is not None and _atk_idx in dropped_indices)
+
         for i, org in enumerate(_ORGS):
             org_key = org["id"].replace("org_", "").replace("_1","")
             is_act  = org_key in active_orgs
@@ -343,7 +353,11 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         sel_labels  = [active_orgs[i].capitalize() for i in selected_indices]
         drop_labels = [active_orgs[i].capitalize() for i in dropped_indices]
-        byz_note    = f" ⚡ Krum flagged {krum_byz_org.upper()} as suspicious" if krum_byz_org else " ✓ no outlier detected"
+        if krum_byz_org:
+            accuracy_tag = " ✓ CORRECT — real attacker caught" if krum_accurate else " ⚠ MISSED — dropped honest node"
+            byz_note = f" ⚡ Krum flagged {krum_byz_org.upper()}{accuracy_tag}"
+        else:
+            byz_note = " ✓ no outlier detected"
         _log(f"  [KRUM] Selected: {sel_labels}  |  Dropped: {drop_labels}{byz_note}")
         _log(f"  [KRUM] Scores → {['%.1f' % s for s in scores]}")
 

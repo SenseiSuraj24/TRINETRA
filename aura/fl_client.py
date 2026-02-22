@@ -213,36 +213,38 @@ def create_mock_clients(
     n_clients:    int   = 3,
     n_samples:    int   = 500,
     feature_dim:  int   = cfg.FEATURE_DIM,
-    attack_client: int  = -1,     # -1 = no forced attack (Krum detects real outliers)
+    attack_client: int  = None,     # None = randomly poison one; -1 = all honest
     org_ids:      list  = None,   # Override org IDs e.g. ["hospital","university"]
 ) -> List["AURAFlowerClient"]:
     """
     Factory function for hackathon demo.
 
     Creates N mock clients with synthetic Gaussian flow data.
-    By default NO client is pre-labelled as Byzantine (attack_client=-1).
-    If you explicitly pass an index, that client's data will be poisoned
-    to simulate a detected attack scenario.
-
-    Byzantine detection is performed server-side by Krum: whichever client
-    is DROPPED by Krum is reported as the suspicious/outlier node.  This
-    means Byzantine is never pre-assigned at random — it is determined
-    purely by the mathematical outlier detection in the aggregation step.
+    One client (attack_client index) has data poisoned to simulate a real
+    network under attack — this is what gives Krum a genuine outlier to detect.
 
     Parameters
     ----------
     attack_client : Index of the client to poison.
-                    -1  → all clients train honestly (default)
-                    0-N → explicitly poison that client index
+                    None  → randomly select one org to inject attack traffic (default)
+                    -1    → all clients train honestly (no Byzantine signal)
+                    0-N   → explicitly poison that client index
     org_ids       : Optional list of org keys ["hospital","bank","university"]
                     overriding the default 3-client set.  Length must match n_clients.
     """
+    import random as _random
+
     _default_orgs = ["hospital", "bank", "university"]
     if org_ids is None:
         org_ids = _default_orgs[:n_clients]
 
-    if attack_client == -1:
-        attack_client = None   # all clients honest
+    # Randomly inject attack data into one org so Krum has a real signal
+    if attack_client is None:
+        attack_client = _random.randint(0, len(org_ids) - 1)
+        logger.info(f"[MOCK] Attack data injected into index {attack_client} "
+                    f"({org_ids[attack_client]}) — Krum should detect this outlier")
+    elif attack_client == -1:
+        attack_client = None   # all clients honest — Krum drop is arbitrary
 
     clients = []
     for i, org_key in enumerate(org_ids):
