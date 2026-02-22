@@ -461,14 +461,39 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
 
         if new_params is not None:
             global_params = parameters_to_ndarrays(new_params)
-            print(f"\n  [SERVER] Global Model {metrics.get('model_version')} ready.")
+            model_version = metrics.get('model_version')
+            server_hash   = metrics.get('model_hash')
+            print(f"\n  [SERVER] Global Model {model_version} aggregated.")
+            print(f"  [SERVER] SHA-256 minted on blockchain: {server_hash[:20]}...")
             print(f"  [SERVER] Krum kept {metrics.get('krum_selected')} / "
                   f"{len(clients)} clients.")
+            print()
 
-            # Simulate client verification
+            # ── Client-side hash verification ────────────────────────────────────
+            # Each client receives the weights, recomputes SHA-256 of what it
+            # received, then fetches the server-minted hash from blockchain and
+            # compares. Mismatch = weights were tampered in transit.
+            client_received_hash = hash_model_weights(global_params)
+
             for client in clients:
-                print(f"  [CLIENT {client.client_id}] Verifying hash on chain… "
-                      f"Match Confirmed ✓  Model deployed.")
+                # Fetch the hash the server minted for this version
+                bc = blockchain_module
+                if bc is not None:
+                    on_chain_ok, _ = bc.verify_model(model_version, client_received_hash)
+                else:
+                    # No blockchain — compare directly against server hash
+                    on_chain_ok = (client_received_hash == server_hash)
+
+                if on_chain_ok:
+                    print(f"  [CLIENT {client.client_id}] "
+                          f"Received hash {client_received_hash[:16]}... "
+                          f"== Blockchain hash {server_hash[:16]}... "
+                          f"→ MATCH. Model deployed.")
+                else:
+                    print(f"  [CLIENT {client.client_id}] "
+                          f"Received hash {client_received_hash[:16]}... "
+                          f"!= Blockchain hash {server_hash[:16]}... "
+                          f"→ MISMATCH! Weights tampered in transit. REJECTING model.")
 
         round_results.append({"round": rnd, **metrics})
 
