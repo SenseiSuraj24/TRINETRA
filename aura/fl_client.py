@@ -254,12 +254,18 @@ def create_mock_clients(
         train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
 
         if i == attack_client:
-            n_attack = n_samples // 5
+            # Strong poisoning: 80% of samples with extreme values across ALL
+            # feature groups — ensures weight update is a clear Krum outlier
+            # rather than noise-level drift that gets masked by random init variance.
+            n_attack = int(n_samples * 0.8)
             attack_rows = torch.rand(n_attack, feature_dim)
-            attack_rows[:, [2, 3, 15]] = torch.rand(n_attack, 3) * 0.3 + 0.7
-            attack_rows[:, [4, 5, 63]] = torch.rand(n_attack, 3) * 0.2 + 0.8
+            # Spike all major feature blocks to max range
+            attack_rows[:, :20]  = torch.rand(n_attack, 20) * 0.5 + 0.5   # flow stats
+            attack_rows[:, 20:40] = torch.rand(n_attack, 20) * 0.4 + 0.6  # packet stats
+            attack_rows[:, 40:60] = torch.rand(n_attack, 20) * 0.6 + 0.4  # flag counts
+            attack_rows[:, 60:]  = torch.rand(n_attack, feature_dim - 60) * 0.9 + 0.1
             train_data[:n_attack] = attack_rows
-            logger.info(f"[{client_id}] Attack simulation injected (Byzantine).")
+            logger.info(f"[{client_id}] Strong attack injection: {n_attack}/{n_samples} samples poisoned.")
 
         val_data = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
         clients.append(AURAFlowerClient(client_id, train_data, val_data))

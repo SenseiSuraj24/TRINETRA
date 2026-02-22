@@ -446,15 +446,18 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
     if active_orgs is None:
         active_orgs = ["hospital", "bank", "university"]
 
-    # Inject real attack data into one randomly-chosen client so Krum has a
-    # genuine outlier to detect (not all-honest → meaningless Krum drop).
-    # The returned attack_idx tells us which org was poisoned; after aggregation
-    # we verify whether Krum correctly identified and dropped that client.
+    # Attack is tied to the bank org — only injected if bank is in active_orgs.
+    # If bank is offline, all clients are honest (no meaningless Krum drop).
+    if "bank" in active_orgs:
+        attack_arg = active_orgs.index("bank")
+    else:
+        attack_arg = -1   # all honest
+
     clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
         n_samples     = 300,
         org_ids       = active_orgs,
-        attack_client = None,   # None = randomly poison one client
+        attack_client = attack_arg,
     )
     strategy = KrumFedAURA(blockchain_module=blockchain_module,
                            num_rounds=n_rounds)

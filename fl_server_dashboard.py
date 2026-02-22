@@ -136,6 +136,13 @@ _ORGS = [
     {"id": "org_university_3",  "label": "University",  "net": "172.16.1.0/24",   "role": "Normal"},
 ]
 
+# Canonical mapping: org id → short key (used everywhere for active_orgs checks)
+_ORG_ID_TO_KEY = {
+    "org_hospital_1":   "hospital",
+    "org_bank_2":       "bank",
+    "org_university_3": "university",
+}
+
 _PIPE_STEPS = [
     ("📥", "Collect\nWeights"),
     ("🔬", "Krum\nFilter"),
@@ -236,20 +243,29 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     st.session_state["total_rounds"] = n_rounds
     st.session_state["active_orgs"]  = active_orgs
 
-    # Inject real attack data into one random org so Krum has a genuine outlier.
-    # attack_idx is which client index was poisoned — used later to check if
-    # Krum correctly detected them (for demo accuracy display).
+    # Attack is tied to BANK org — the designated compromised node.
+    # If Bank is not in active_orgs it is offline, so all clients are honest.
+    if "bank" in active_orgs:
+        bank_idx = active_orgs.index("bank")
+        attack_client_arg = bank_idx
+        attack_org = "bank"
+    else:
+        attack_client_arg = -1   # bank offline → no poisoning this run
+        attack_org = None
+
     clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
         n_samples     = 300,
         org_ids       = active_orgs,
-        attack_client = None,   # None = randomly inject attack into one org
+        attack_client = attack_client_arg,
     )
-    st.session_state["byzantine_org"]  = None   # will be set after Krum runs
-    st.session_state["attack_idx"]     = attack_idx  # poisoned client index
-    attack_org = active_orgs[attack_idx] if attack_idx is not None else None
-    _log(f"🦠 Attack data injected into: {attack_org.upper() if attack_org else 'none'} "
-         f"— Krum will now attempt to detect this outlier")
+    st.session_state["byzantine_org"] = None
+    st.session_state["attack_idx"]    = attack_idx
+    if attack_org:
+        _log(f"\U0001f9a0 Attack data injected into: BANK (index {attack_idx}) "
+             f"\u2014 Krum will attempt to detect this outlier")
+    else:
+        _log("\u2705 Bank is offline \u2014 all active orgs are honest this run")
 
     strategy = KrumFedAURA(blockchain_module=bc_module, num_rounds=n_rounds)
 
@@ -341,7 +357,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         krum_accurate = (_atk_idx is not None and _atk_idx in dropped_indices)
 
         for i, org in enumerate(_ORGS):
-            org_key = org["id"].replace("org_", "").replace("_1","")
+            org_key = _ORG_ID_TO_KEY.get(org["id"], org["id"])
             is_act  = org_key in active_orgs
             act_idx = active_orgs.index(org_key) if is_act else None
             is_sel  = is_act and (act_idx in selected_indices)
@@ -405,7 +421,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         if is_final:
             client_received_hash = hash_model_weights(global_params)
             for i, org in enumerate(_ORGS):
-                org_key = org["id"].replace("org_","").replace("_1","")
+                org_key = _ORG_ID_TO_KEY.get(org["id"], org["id"])
                 if org_key not in active_orgs:
                     continue
                 match = (client_received_hash == model_hash)
@@ -490,16 +506,11 @@ def _render_clients(card_phs):
     }
     # Resolve Byzantine dynamically from Krum result, not from static _ORGS
     _krum_byz   = st.session_state.get("byzantine_org")
-    _org_key_of = {
-        "org_hospital_1":   "hospital",
-        "org_bank_2":       "bank",
-        "org_university_3": "university",
-    }
     for i, org in enumerate(_ORGS):
         c    = cards[org["id"]]
         raw  = c.get("status", "idle")
         lbl, color, css = status_label.get(raw, ("Idle", THEME["dim"], "idle"))
-        is_byz     = bool(_krum_byz and _krum_byz == _org_key_of[org["id"]])
+        is_byz     = bool(_krum_byz and _krum_byz == _ORG_ID_TO_KEY.get(org["id"]))
         role_label = "⚠ Krum-flagged" if is_byz else "✓ Normal"
         role_color = THEME["orange"] if is_byz else THEME["green"]
         vfy = c.get("verified")
