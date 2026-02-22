@@ -172,6 +172,7 @@ def _init():
         "byzantine_org":    None,  # org key Krum dropped (detected outlier)
         "attack_idx":       None,  # index of client with injected attack data
         "active_orgs":      [],    # orgs that participated in the last FL run
+        "quarantined_orgs": [],    # orgs blocked due to active attack
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -208,15 +209,24 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     # ── Determine active orgs from shared readiness file ────────────────────────
     readiness = _read_readiness()
     all_org_keys = ["hospital", "bank", "university"]
+    # Exclude orgs that are: (a) not ready, OR (b) currently under active attack.
+    # Under-attack orgs are quarantined — they must NOT contribute weights to FL
+    # because their data is compromised. They are blocked before FL starts, not
+    # Krum-dropped after (Krum is a last-resort defence; quarantine is proactive).
+    quarantined = [k for k in all_org_keys
+                   if readiness.get(k, {}).get("under_attack", False)]
     active_orgs = [k for k in all_org_keys
-                   if readiness.get(k, {}).get("ready", False)]
+                   if readiness.get(k, {}).get("ready", False)
+                   and k not in quarantined]
     # Fall back to all 3 if no readiness data exists (demo mode)
-    if not active_orgs:
+    if not active_orgs and not quarantined:
         active_orgs = all_org_keys
         _log("No readiness data found — using all 3 orgs (demo mode)")
     else:
-        inactive = [k for k in all_org_keys if k not in active_orgs]
-        _log(f"Active: {active_orgs}  |  Inactive (excluded): {inactive if inactive else 'none'}")
+        inactive = [k for k in all_org_keys if k not in active_orgs and k not in quarantined]
+        if quarantined:
+            _log(f"🚨 Quarantined (under attack — BLOCKED from FL): {[k.upper() for k in quarantined]}")
+        _log(f"Active: {active_orgs}  |  Offline: {inactive if inactive else 'none'}")
 
     st.session_state["fl_running"]    = True
     st.session_state["fl_done"]       = False
@@ -242,9 +252,17 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     n_rounds = cfg.FL_NUM_ROUNDS
     st.session_state["total_rounds"] = n_rounds
     st.session_state["active_orgs"]  = active_orgs
+    st.session_state["quarantined_orgs"] = quarantined
 
-    # Attack is tied to BANK org — the designated compromised node.
-    # If Bank is not in active_orgs it is offline, so all clients are honest.
+    # Mark quarantined org cards immediately so they show as blocked
+    for _qk in quarantined:
+        _qid = {"hospital": "org_hospital_1", "bank": "org_bank_2", "university": "org_university_3"}[_qk]
+        st.session_state["client_cards"][_qid]["status"] = "quarantined"
+
+    # Attack is tied to BANK org — only if bank is active (not quarantined/offline).
+    # If bank is quarantined it's already excluded from active_orgs above, so no
+    # poisoned data enters FL at all. If bank is active we still inject its
+    # compromised data so Krum can demonstrate detection against a real signal.
     if "bank" in active_orgs:
         bank_idx = active_orgs.index("bank")
         attack_client_arg = bank_idx
@@ -358,12 +376,19 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         for i, org in enumerate(_ORGS):
             org_key = _ORG_ID_TO_KEY.get(org["id"], org["id"])
+            is_quar = org_key in quarantined
             is_act  = org_key in active_orgs
             act_idx = active_orgs.index(org_key) if is_act else None
             is_sel  = is_act and (act_idx in selected_indices)
-            is_byz  = is_act and (act_idx is not None) and (act_idx in dropped_indices)
-            st.session_state["client_cards"][org["id"]]["status"]   = (
-                "selected" if is_sel else ("dropped" if is_act else "offline"))
+            if is_quar:
+                new_status = "quarantined"  # preserve — never overwrite with offline
+            elif is_sel:
+                new_status = "selected"
+            elif is_act:
+                new_status = "dropped"
+            else:
+                new_status = "offline"
+            st.session_state["client_cards"][org["id"]]["status"]   = new_status
             st.session_state["client_cards"][org["id"]]["selected"] = is_sel
         _render_clients(card_placeholders)
 
@@ -498,21 +523,30 @@ def _render_pipe(ph):
 def _render_clients(card_phs):
     cards = st.session_state["client_cards"]
     status_label = {
-        "idle":     ("Idle",            THEME["dim"],    "idle"),
-        "sending":  ("Sending…",        THEME["yellow"], "idle"),
-        "selected": ("✓ Selected",      THEME["green"],  "selected"),
-        "dropped":  ("✗ Dropped",       THEME["red"],    "dropped"),
-        "offline":  ("⏸ Not Ready",     THEME["dim"],    "idle"),
+        "idle":        ("Idle",                         THEME["dim"],    "idle"),
+        "sending":     ("Sending\u2026",                THEME["yellow"], "idle"),
+        "selected":    ("\u2713 Selected",              THEME["green"],  "selected"),
+        "dropped":     ("\u2717 Dropped",               THEME["red"],    "dropped"),
+        "offline":     ("\u23f8 Not Ready",             THEME["dim"],    "idle"),
+        "quarantined": ("\U0001f6ab Quarantined",       THEME["red"],    "dropped"),
     }
-    # Resolve Byzantine dynamically from Krum result, not from static _ORGS
-    _krum_byz   = st.session_state.get("byzantine_org")
+    # Resolve Byzantine and quarantine dynamically from session state
+    _krum_byz    = st.session_state.get("byzantine_org")
+    _quarantined = st.session_state.get("quarantined_orgs", [])
     for i, org in enumerate(_ORGS):
-        c    = cards[org["id"]]
-        raw  = c.get("status", "idle")
+        c       = cards[org["id"]]
+        raw     = c.get("status", "idle")
+        org_key = _ORG_ID_TO_KEY.get(org["id"])
         lbl, color, css = status_label.get(raw, ("Idle", THEME["dim"], "idle"))
-        is_byz     = bool(_krum_byz and _krum_byz == _ORG_ID_TO_KEY.get(org["id"]))
-        role_label = "⚠ Krum-flagged" if is_byz else "✓ Normal"
-        role_color = THEME["orange"] if is_byz else THEME["green"]
+        if org_key in _quarantined:
+            role_label = "🚨 Under Attack — Blocked"
+            role_color = THEME["red"]
+        elif _krum_byz and _krum_byz == org_key:
+            role_label = "⚠ Krum-flagged"
+            role_color = THEME["orange"]
+        else:
+            role_label = "✓ Normal"
+            role_color = THEME["green"]
         vfy = c.get("verified")
         vfy_html = ""
         _vfy_grn = THEME["green"]
@@ -707,25 +741,36 @@ with _readiness_btn_col:
     st.button("🔄 Refresh", key="_refresh_readiness", use_container_width=True)
 
 _ORG_ICONS = {"hospital": "🏥", "bank": "🏦", "university": "🎓"}
-_readiness_data = _read_readiness()
-_byz_last = st.session_state.get("byzantine_org")
+_readiness_data  = _read_readiness()
+_byz_last        = st.session_state.get("byzantine_org")
+_quarantined_now = st.session_state.get("quarantined_orgs", [])
 _rd_cols = st.columns(3)
 for _ri, _org_k in enumerate(["hospital", "bank", "university"]):
-    _info = _readiness_data.get(_org_k, {})
-    _ready = _info.get("ready", False)
-    _icon = _ORG_ICONS[_org_k]
-    _label = _org_k.capitalize()
-    _pill_color = THEME["green"] if _ready else THEME["red"]
-    _pill_text  = "🟢 READY" if _ready else "🔴 NOT READY"
-    _byz_badge  = (
+    _info         = _readiness_data.get(_org_k, {})
+    _ready        = _info.get("ready", False)
+    _is_quarantine= _info.get("under_attack", False)
+    _icon         = _ORG_ICONS[_org_k]
+    _label        = _org_k.capitalize()
+    _net          = _info.get("net", "—")
+
+    if _is_quarantine:
+        _pill_color = THEME["red"]
+        _pill_text  = "🚨 QUARANTINED — Under Attack"
+    elif _ready:
+        _pill_color = THEME["green"]
+        _pill_text  = "🟢 READY"
+    else:
+        _pill_color = THEME["dim"]
+        _pill_text  = "🔴 NOT READY"
+
+    _byz_badge = (
         f"<span style='background:{THEME['yellow']};color:#000;border-radius:4px;"
         f"padding:1px 6px;font-size:0.75em;margin-left:6px;'>⚡ Krum-flagged</span>"
         if _byz_last == _org_k else ""
     )
-    _net = _info.get("net", "—")
     with _rd_cols[_ri]:
         st.markdown(
-            f"<div style='border:1px solid {_pill_color};border-radius:8px;"
+            f"<div style='border:2px solid {_pill_color};border-radius:8px;"
             f"padding:10px 14px;background:{THEME['panel']};margin-bottom:8px'>"
             f"<b style='font-size:1.05em'>{_icon} {_label}</b>{_byz_badge}<br>"
             f"<span style='color:{_pill_color};font-weight:600'>{_pill_text}</span><br>"
@@ -739,6 +784,17 @@ if _byz_last:
         f"<div style='color:{THEME['yellow']};font-size:0.85em;margin-bottom:8px'>"
         f"⚡ Krum-flagged suspicious node last run: <b>{_byz_last.upper()}</b>"
         f" — this client's update was a mathematical outlier and was dropped by aggregation."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+if _quarantined_now:
+    st.markdown(
+        f"<div style='color:{THEME['red']};font-size:0.85em;margin-bottom:8px;"
+        f"border:1px solid {THEME['red']};border-radius:6px;padding:6px 10px'>"
+        f"🚨 <b>Quarantined orgs blocked from FL this run: "
+        f"{', '.join(k.upper() for k in _quarantined_now)}</b>"
+        f" — attack must end before they can rejoin federation."
         f"</div>",
         unsafe_allow_html=True,
     )

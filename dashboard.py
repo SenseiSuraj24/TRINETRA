@@ -141,6 +141,7 @@ def _init_state():
         "last_explanation": None,   # Most recent AE explainer output dict
         "fl_client_status": [],     # Per-client metadata from latest FL round
         "fl_ready":         False,  # Whether this org node has signalled FL readiness
+        "under_attack":     False,  # Whether this org is currently under active attack
     }
     # Sync readiness from shared file if this is an org node
     if ORG and "fl_ready" not in st.session_state:
@@ -148,7 +149,8 @@ def _init_state():
         if _rf.exists():
             try:
                 _rd = json.loads(_rf.read_text())
-                defaults["fl_ready"] = _rd.get(_ORG_KEY, {}).get("ready", False)
+                defaults["fl_ready"]     = _rd.get(_ORG_KEY, {}).get("ready", False)
+                defaults["under_attack"] = _rd.get(_ORG_KEY, {}).get("under_attack", False)
             except Exception:
                 pass
     for k, v in defaults.items():
@@ -761,9 +763,9 @@ with ctrl_fl:
 
     # ── FL Readiness Toggle ──────────────────────────────────────────────────
     _ready = st.session_state.get("fl_ready", False)
-    _ready_color  = THEME["green"]  if _ready else THEME["dim"]
-    _ready_status = "🟢 READY"      if _ready else "🔴 NOT READY"
-    _ready_label  = THEME["green"]  if _ready else THEME["red"]
+    _under_attack = st.session_state.get("under_attack", False)
+    _ready_color  = THEME["green"]  if (_ready and not _under_attack) else (THEME["red"] if _under_attack else THEME["dim"])
+    _ready_status = "🚨 UNDER ATTACK — QUARANTINED" if _under_attack else ("🟢 READY" if _ready else "🔴 NOT READY")
 
     st.markdown(
         f"<div style='background:{THEME['panel']}; border:1px solid {_ready_color}; "
@@ -775,11 +777,7 @@ with ctrl_fl:
         unsafe_allow_html=True,
     )
 
-    _toggle_label = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
-    if st.button(_toggle_label, use_container_width=True):
-        new_ready = not _ready
-        st.session_state["fl_ready"] = new_ready
-        # Write to shared readiness file so FL Server Console can see it
+    def _write_readiness(ready_val, attack_val):
         if ORG:
             import json as _json
             _rf = Path(cfg.LOGS_DIR) / "fl_readiness.json"
@@ -790,10 +788,35 @@ with ctrl_fl:
                     _rd = _json.loads(_rf.read_text())
                 except Exception:
                     _rd = {}
-            _rd[_ORG_KEY] = {"ready": new_ready, "org": ORG["label"],
-                              "net": ORG["net"], "ts": time.time()}
+            _rd[_ORG_KEY] = {
+                "ready":        ready_val,
+                "under_attack": attack_val,
+                "org":          ORG["label"],
+                "net":          ORG["net"],
+                "ts":           time.time(),
+            }
             _rf.write_text(_json.dumps(_rd, indent=2))
-        st.rerun()
+
+    _atk_btn_label = "✅ Attack Ended — Resume" if _under_attack else "🚨 Report Under Attack"
+    _atk_btn_type  = "primary" if _under_attack else "secondary"
+    _toggle_label  = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
+
+    _fl_col, _atk_col = st.columns(2)
+    with _fl_col:
+        if st.button(_toggle_label, use_container_width=True, disabled=_under_attack):
+            new_ready = not _ready
+            st.session_state["fl_ready"] = new_ready
+            _write_readiness(new_ready, _under_attack)
+            st.rerun()
+    with _atk_col:
+        if st.button(_atk_btn_label, use_container_width=True, type=_atk_btn_type):
+            new_attack = not _under_attack
+            st.session_state["under_attack"] = new_attack
+            # Under attack forces not-ready; attack ended restores previous ready state
+            new_ready = False if new_attack else _ready
+            st.session_state["fl_ready"] = new_ready
+            _write_readiness(new_ready, new_attack)
+            st.rerun()
 
     # ── Client Status Table ──────────────────────────────────────────────────
     clients_info = st.session_state.get("fl_client_status", [])
