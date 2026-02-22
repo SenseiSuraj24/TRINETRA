@@ -23,6 +23,7 @@ Layout
 """
 
 import json
+import os
 import time
 import threading
 import hashlib
@@ -46,12 +47,27 @@ from aura.attack_injector import AttackInjector, AttackType
 from aura.blockchain import AURABlockchainLogger
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Org Identity  (set via AURA_ORG_ID env var before launching)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ORG_PROFILES = {
+    "hospital":   {"label": "Hospital",    "id": "org_hospital_1",   "net": "192.168.1.0/24",  "icon": "🏥", "role": "Normal",    "color": "#00ff88"},
+    "bank":       {"label": "Bank",        "id": "org_bank_2",       "net": "10.0.1.0/24",    "icon": "🏦", "role": "Byzantine", "color": "#ff8800"},
+    "university": {"label": "University",  "id": "org_university_3", "net": "172.16.1.0/24",  "icon": "🎓", "role": "Normal",    "color": "#4488ff"},
+}
+_ORG_KEY  = os.environ.get("AURA_ORG_ID", "").lower().strip()
+ORG       = _ORG_PROFILES.get(_ORG_KEY)   # None if not set
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page Config
 # ─────────────────────────────────────────────────────────────────────────────
 
+_page_title = f"AURA — {ORG['icon']} {ORG['label']}" if ORG else "AURA — Autonomous Unified Resilience Architecture"
+_page_icon  = ORG["icon"] if ORG else "🛡️"
+
 st.set_page_config(
-    page_title = "AURA — Autonomous Unified Resilience Architecture",
-    page_icon  = "🛡️",
+    page_title = _page_title,
+    page_icon  = _page_icon,
     layout     = "wide",
     initial_sidebar_state = "expanded",
 )
@@ -124,6 +140,7 @@ def _init_state():
         "window_counter":  0,
         "last_explanation": None,   # Most recent AE explainer output dict
         "fl_client_status": [],     # Per-client metadata from latest FL round
+        "fl_ready":         False,  # Whether this org node has signalled FL readiness
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -459,6 +476,17 @@ def run_federation():
 status_color = {"ACTIVE": THEME["green"], "INITIALISING": THEME["yellow"],
                 "UNDER ATTACK": THEME["red"]}.get(st.session_state["system_status"], THEME["yellow"])
 
+_org_badge = ""
+if ORG:
+    _badge_color = ORG["color"]
+    _org_badge = (
+        f"<span style='background:{_badge_color}22; border:1px solid {_badge_color}; "
+        f"border-radius:20px; padding:2px 12px; font-size:0.82em; "
+        f"color:{_badge_color}; margin-left:0.8em; font-weight:bold'>"
+        f"{ORG['icon']} {ORG['label'].upper()}  ·  {ORG['net']}"
+        f"</span>"
+    )
+
 st.markdown(f"""
 <div style="display:flex; justify-content:space-between; align-items:center;
             background:{THEME['panel']}; border:1px solid {THEME['border']};
@@ -470,6 +498,7 @@ st.markdown(f"""
     <span style="color:{THEME['dim']}; margin-left:0.5em; font-size:0.85em;">
       Autonomous Unified Resilience Architecture
     </span>
+    {_org_badge}
   </div>
   <div style="text-align:right;">
     <span style="color:{status_color}; font-weight:bold; font-size:0.95em;">
@@ -717,13 +746,30 @@ with ctrl_atk:
 
 # ── Federation Panel ──────────────────────────────────────────────────────────
 with ctrl_fl:
-    st.markdown(f"<h4 style='color:{THEME['blue']}'>🌐 Federated Learning</h4>",
+    _fl_heading = f"{ORG['icon']} {ORG['label']} · Federated Learning" if ORG else "🌐 Federated Learning"
+    st.markdown(f"<h4 style='color:{THEME['blue']}'>{_fl_heading}</h4>",
                 unsafe_allow_html=True)
 
-    if st.button("▶ Run FL Simulation (3 rounds)", use_container_width=True):
-        with st.spinner("Running Krum-aggregated federation …"):
-            run_federation()
-        st.toast("✅ Federation complete!  All clients immunised.", icon="🛡️")
+    # ── FL Readiness Toggle ──────────────────────────────────────────────────
+    _ready = st.session_state.get("fl_ready", False)
+    _ready_color  = THEME["green"]  if _ready else THEME["dim"]
+    _ready_status = "🟢 READY"      if _ready else "🔴 NOT READY"
+    _ready_label  = THEME["green"]  if _ready else THEME["red"]
+
+    st.markdown(
+        f"<div style='background:{THEME['panel']}; border:1px solid {_ready_color}; "
+        f"border-radius:8px; padding:0.55rem 0.8rem; margin-bottom:0.5rem; "
+        f"text-align:center; font-size:0.9em'>"
+        f"<span style='color:{THEME['dim']}'>Are you ready for FL?</span>&nbsp;&nbsp;"
+        f"<span style='color:{_ready_color}; font-weight:bold'>{_ready_status}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    _toggle_label = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
+    if st.button(_toggle_label, use_container_width=True):
+        st.session_state["fl_ready"] = not _ready
+        st.rerun()
 
     # ── Client Status Table ──────────────────────────────────────────────────
     clients_info = st.session_state.get("fl_client_status", [])
