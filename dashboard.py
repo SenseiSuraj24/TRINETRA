@@ -122,6 +122,8 @@ def _init_state():
         "chain_entries":   0,
         "models_loaded":   False,
         "window_counter":  0,
+        "last_explanation": None,   # Most recent AE explainer output dict
+        "fl_client_status": [],     # Per-client metadata from latest FL round
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -337,6 +339,22 @@ def run_inference_tick(graph: dict, is_attack: bool = False):
         if len(st.session_state["alerts"]) > 30:
             st.session_state["alerts"] = st.session_state["alerts"][:30]
 
+        # Store explanation for the live panel (overwrite with latest triggered event)
+        if event.inferred_attack != "Normal" and event.top_features:
+            from aura.ae_explainer import ATTACK_EXPLANATIONS
+            st.session_state["last_explanation"] = {
+                "inferred_attack": event.inferred_attack,
+                "match_score":     event.match_score,
+                "top_features":    event.top_features,
+                "group_residuals": event.group_residuals,
+                "severity":        event.severity.name,
+                "confidence":      event.confidence,
+                "explanation":     ATTACK_EXPLANATIONS.get(
+                    event.inferred_attack,
+                    ATTACK_EXPLANATIONS.get("Unknown Anomaly", {})
+                ),
+            }
+
         # Run response engine
         records = resp.act(event)
         for r in records:
@@ -347,10 +365,33 @@ def run_inference_tick(graph: dict, is_attack: bool = False):
             st.session_state["incidents"] = st.session_state["incidents"][:20]
 
     elif is_attack:
-        # Attack was injected but warmup period active
+        # Attack was injected but EMA warmup still active — L1 not yet triggered.
+        # Run the explainer directly on the raw features so the operator can
+        # already see WHAT is anomalous, even before a formal alert fires.
         for nid in graph.get("attack_nodes", []):
             colors[nid] = THEME["yellow"]
             states[nid] = "Evaluating…"
+
+        try:
+            from aura.ae_explainer import explain_ae, ATTACK_EXPLANATIONS
+            edge_attr = graph.get("edge_attr")
+            if edge_attr is not None:
+                feat_residuals = eng.ae.explain_features(edge_attr)
+                expl = explain_ae(feat_residuals)
+                st.session_state["last_explanation"] = {
+                    "inferred_attack": expl["inferred_attack"],
+                    "match_score":     expl["match_score"],
+                    "top_features":    expl["top_features"],
+                    "group_residuals": expl["group_residuals"],
+                    "severity":        "LOW",   # warmup → tentative
+                    "confidence":      expl["match_score"],
+                    "explanation":     ATTACK_EXPLANATIONS.get(
+                        expl["inferred_attack"],
+                        ATTACK_EXPLANATIONS.get("Unknown Anomaly", {})
+                    ),
+                }
+        except Exception:
+            pass
 
     st.session_state["node_colors"]   = colors
     st.session_state["node_states"]   = states
@@ -381,6 +422,10 @@ def run_federation():
         version = r.get("model_version", "N/A")
         h       = r.get("model_hash", "N/A")
         kept    = r.get("krum_selected", "?")
+
+        # Keep the latest round's per-client status for the dashboard table
+        if "client_statuses" in r:
+            st.session_state["fl_client_status"] = r["client_statuses"]
 
         st.session_state["fed_log"].extend([
             f"━━━  Round {rnd}  ━━━",
@@ -520,6 +565,102 @@ with col_score:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AE Explanation Panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.markdown(
+    f"<h4 style='color:{THEME['yellow']}'>🧠 AE Explanation — Why did the score spike?</h4>",
+    unsafe_allow_html=True
+)
+
+_expl = st.session_state.get("last_explanation")
+if _expl is None:
+    _dim = THEME["dim"]
+    st.markdown(
+        f"<div style='color:{_dim}; font-size:0.85em; padding:0.5rem 0'>"
+        "No anomaly detected yet.  Inject an attack to see a live explanation."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    _e     = _expl["explanation"]
+    _sev   = _expl["severity"]
+    _conf  = _expl["confidence"]
+    _match = _expl["match_score"]
+    _atk   = _expl["inferred_attack"]
+    _icon  = _e.get("icon", "")
+    _summ  = _e.get("summary", "")
+    _det   = _e.get("detail", "")
+    _why   = _e.get("why_high", "")
+
+    sev_color = {"HIGH": THEME["red"], "MEDIUM": THEME["orange"],
+                 "LOW": THEME["yellow"]}.get(_sev, THEME["cyan"])
+
+    expl_left, expl_mid, expl_right = st.columns([1.3, 1.0, 0.9])
+
+    # ── Left: Attack classification + detail ──────────────────────────────
+    with expl_left:
+        _bg, _br = THEME["panel"], THEME["border"]
+        st.markdown(
+            f"<div style='background:{_bg}; border:1px solid {sev_color}; "
+            f"border-radius:8px; padding:0.8rem 1rem;'>"
+            f"<div style='font-size:1.1em; font-weight:bold; color:{sev_color}'>"
+            f"{_icon} {_atk}</div>"
+            f"<div style='color:{THEME['text']}; font-size:0.85em; margin:0.4rem 0'>"
+            f"{_summ}</div>"
+            f"<hr style='border-color:{THEME['border']}; margin:0.5rem 0'>"
+            f"<div style='color:{THEME['dim']}; font-size:0.78em; line-height:1.5'>"
+            f"{_det}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Mid: Top contributing features bar chart ───────────────────────────
+    with expl_mid:
+        _top   = _expl["top_features"][:6]
+        _names = [f[0] for f in _top][::-1]
+        _vals  = [f[1] for f in _top][::-1]
+        import plotly.graph_objects as go
+        fig_feat = go.Figure(go.Bar(
+            y=_names,
+            x=_vals,
+            orientation="h",
+            marker_color=sev_color,
+            marker_line_width=0,
+        ))
+        fig_feat.update_layout(
+            title=dict(text="Top Anomalous Features", font=dict(color=THEME["text"], size=12)),
+            paper_bgcolor=THEME["bg"],
+            plot_bgcolor=THEME["panel"],
+            font=dict(color=THEME["dim"], size=10),
+            height=200,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(gridcolor=THEME["border"], title="Mean |residual|"),
+            yaxis=dict(gridcolor=THEME["border"]),
+        )
+        st.plotly_chart(fig_feat, use_container_width=True, key="feat_chart")
+
+    # ── Right: Match confidence + why the score is high ──────────────────
+    with expl_right:
+        _bg, _br = THEME["panel"], THEME["border"]
+        st.markdown(
+            f"<div style='background:{_bg}; border:1px solid {_br}; "
+            f"border-radius:8px; padding:0.8rem 1rem;'>"
+            f"<div style='color:{THEME['dim']}; font-size:0.78em'>Signature match</div>"
+            f"<div style='font-size:1.4em; color:{sev_color}; font-weight:bold'>"
+            f"{_match:.0%}</div>"
+            f"<div style='color:{THEME['dim']}; font-size:0.78em; margin-top:0.6rem'>Detection confidence</div>"
+            f"<div style='font-size:1.4em; color:{THEME['text']}; font-weight:bold'>"
+            f"{_conf:.0%}</div>"
+            f"<hr style='border-color:{THEME['border']}; margin:0.5rem 0'>"
+            f"<div style='color:{THEME['dim']}; font-size:0.76em; line-height:1.5'>"
+            f"<b style='color:{THEME['text']}'>Why is the score high?</b><br>{_why}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Control Panel (3 columns)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -556,6 +697,7 @@ with ctrl_atk:
                     f"Confidence: {event.confidence:.1%}",
                     icon="🚨" if event.severity == AlertSeverity.HIGH else "⚠️"
                 )
+                st.rerun()
 
     if st.button("🟢 Generate Normal Traffic", use_container_width=True):
         st.session_state["attack_active"] = False
@@ -571,6 +713,7 @@ with ctrl_atk:
         st.session_state["node_colors"] = {i: THEME["green"] for i in range(cfg.NUM_SYNTHETIC_NODES)}
         st.session_state["node_states"] = {i: "Normal" for i in range(cfg.NUM_SYNTHETIC_NODES)}
         st.toast("✅ Normal traffic window processed.", icon="✅")
+        st.rerun()
 
 # ── Federation Panel ──────────────────────────────────────────────────────────
 with ctrl_fl:
@@ -581,6 +724,56 @@ with ctrl_fl:
         with st.spinner("Running Krum-aggregated federation …"):
             run_federation()
         st.toast("✅ Federation complete!  All clients immunised.", icon="🛡️")
+
+    # ── Client Status Table ──────────────────────────────────────────────────
+    clients_info = st.session_state.get("fl_client_status", [])
+    if clients_info:
+        _bg  = THEME["panel"]
+        _br  = THEME["border"]
+        _cy  = THEME["cyan"]
+        _dim = THEME["dim"]
+        _grn = THEME["green"]
+        _red = THEME["red"]
+        _org = THEME["orange"]
+
+        rows_html = ""
+        for c in clients_info:
+            org     = c.get("org_id",   "unknown")
+            network = c.get("network",  "—")
+            role    = c.get("role",     "Normal")
+            selected= c.get("selected", True)
+
+            role_color   = _red if role == "Byzantine" else _grn
+            status_label = "✓ Selected" if selected else "✗ Dropped"
+            status_color = _grn         if selected else _red
+            if not selected and role == "Byzantine":
+                status_label = "✗ Dropped (Byzantine)"
+
+            rows_html += (
+                f"<tr style='border-bottom:1px solid {_br}'>"
+                f"<td style='padding:3px 6px; color:{_cy}'>{org}</td>"
+                f"<td style='padding:3px 6px; color:{_dim}'>{network}</td>"
+                f"<td style='padding:3px 6px; color:{role_color}'>{role}</td>"
+                f"<td style='padding:3px 6px; color:{status_color}'>{status_label}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"<div style='background:{_bg}; border:1px solid {_br}; "
+            f"border-radius:6px; padding:0.5rem; margin-bottom:0.4rem'>"
+            f"<div style='color:{_dim}; font-size:0.72em; "
+            f"margin-bottom:0.3rem'>FL CLIENT STATUS (latest round)</div>"
+            f"<table style='width:100%; border-collapse:collapse; font-size:0.73em'>"
+            f"<thead><tr style='color:{_dim}; border-bottom:1px solid {_br}'>"
+            f"<th style='text-align:left; padding:2px 6px'>Org</th>"
+            f"<th style='text-align:left; padding:2px 6px'>Network</th>"
+            f"<th style='text-align:left; padding:2px 6px'>Role</th>"
+            f"<th style='text-align:left; padding:2px 6px'>Krum</th>"
+            f"</tr></thead>"
+            f"<tbody>{rows_html}</tbody>"
+            f"</table></div>",
+            unsafe_allow_html=True,
+        )
 
     # Show last N fed log lines
     if st.session_state["fed_log"]:
@@ -745,6 +938,7 @@ with st.sidebar:
         st.session_state["node_colors"] = {i: THEME["green"] for i in range(cfg.NUM_SYNTHETIC_NODES)}
         st.session_state["node_states"] = {i: "Normal" for i in range(cfg.NUM_SYNTHETIC_NODES)}
         st.session_state["system_status"] = "ACTIVE"
+        st.session_state["last_explanation"] = None
         st.rerun()
 
     st.markdown("---")

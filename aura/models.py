@@ -45,6 +45,7 @@ import math
 import logging
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -292,6 +293,23 @@ class FlowAutoencoder(nn.Module):
             # Per-sample MSE (mean over feature dimension)
             scores = ((x - x_hat) ** 2).mean(dim=1)   # [B]
         return scores
+
+    def explain_features(self, x: torch.Tensor) -> np.ndarray:
+        """
+        Per-feature mean absolute residual for explainability.
+
+        Returns the mean |x - x_hat| averaged over the batch dimension,
+        giving a [F] numpy array where large values indicate which features
+        the model found hardest to reconstruct (i.e. most anomalous).
+
+        Used by ae_explainer.explain_ae() to infer attack category and
+        generate the human-readable operator explanation panel.
+        """
+        with torch.no_grad():
+            x_hat, _ = self.forward(x)
+            # Mean absolute error per feature dimension [F]
+            feature_residuals = (x - x_hat).abs().mean(dim=0)   # [F]
+        return feature_residuals.cpu().numpy()
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

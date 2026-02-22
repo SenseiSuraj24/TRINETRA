@@ -74,6 +74,11 @@ class AnomalyEvent:
     triggered_nodes: List[int]      # Node IDs exceeding GNN threshold
     confidence:      float          # Fused confidence in [0, 1]
     raw_label_ratio: float          # Ground-truth attack ratio (if available)
+    # Explainability fields (populated when L1 triggers)
+    top_features:    List[tuple]    # [(feature_name, residual, index), ...]
+    inferred_attack: str            # Best-match attack category label
+    match_score:     float          # Cosine similarity of residual vs signature
+    group_residuals: dict           # {group_name: mean_residual}
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +91,8 @@ class AnomalyEvent:
             "triggered_nodes": self.triggered_nodes,
             "confidence":      round(self.confidence, 4),
             "raw_label_ratio": round(self.raw_label_ratio, 4),
+            "inferred_attack": self.inferred_attack,
+            "match_score":     round(self.match_score, 3),
         }
 
 
@@ -276,7 +283,23 @@ class AURAInferenceEngine:
         # Check BEFORE update so threshold reflects history, not current batch
         l1_triggered = self.ema.is_anomalous(batch_mse)
         current_threshold = self.ema.update(batch_mse)
+        # ── Feature Attribution & Attack Classification (when L1 fires) ───
+        top_features    = []
+        inferred_attack = "Normal"
+        match_score     = 0.0
+        group_residuals: dict = {}
 
+        if l1_triggered:
+            try:
+                from aura.ae_explainer import explain_ae
+                feat_residuals  = self.ae.explain_features(edge_attr)   # [F]
+                expl            = explain_ae(feat_residuals)
+                top_features    = expl["top_features"]
+                inferred_attack = expl["inferred_attack"]
+                match_score     = expl["match_score"]
+                group_residuals = expl["group_residuals"]
+            except Exception as _e:
+                logger.debug(f"Explainer skipped: {_e}")
         # ── Layer 2: Contextual Validator (only if L1 triggered) ──────────
         gnn_scores      = None
         triggered_nodes = []
@@ -314,6 +337,10 @@ class AURAInferenceEngine:
             triggered_nodes  = triggered_nodes,
             confidence       = confidence,
             raw_label_ratio  = gt_ratio,
+            top_features     = top_features,
+            inferred_attack  = inferred_attack,
+            match_score      = match_score,
+            group_residuals  = group_residuals,
         )
 
         self._event_log.append(event)

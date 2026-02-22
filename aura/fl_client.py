@@ -248,10 +248,78 @@ def create_mock_clients(
     return clients
 
 
-# CLI test handle — see fl_server.py for the full federation run
+# ─────────────────────────────────────────────────────────────────────────────
+# Networked Client Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def start_client(
+    client_id:      str,
+    server_address: str = cfg.FL_SERVER_ADDRESS,
+    n_samples:      int = 500,
+    is_byzantine:   bool = False,
+) -> None:
+    """
+    Start a Flower gRPC client that connects to the FL server over the network.
+
+    This is the REAL networked FL entry point.  Each organisation's gateway
+    switch runs this function in its own process — the client dials the
+    aggregation server via gRPC, trains locally, and sends only weight deltas
+    (raw data NEVER leaves the network).
+
+    Parameters
+    ----------
+    client_id      : human-readable org identifier (e.g. "org_hospital_1")
+    server_address : host:port of the FL aggregation server
+    n_samples      : number of local flow records to train on
+    is_byzantine   : if True, injects attack-pattern data (adversarial client)
+    """
+    import flwr as fl
+
+    feature_dim = cfg.FEATURE_DIM
+
+    # ── Simulate each org's local network traffic distribution ──────────────
+    train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
+    val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
+
+    if is_byzantine:
+        # Adversarial client: poisoned data with extreme feature values
+        n_attack = n_samples // 5
+        attack_rows = torch.rand(n_attack, feature_dim)
+        attack_rows[:, [2, 3, 15]] = torch.rand(n_attack, 3) * 0.3 + 0.7
+        attack_rows[:, [4, 5, 63]] = torch.rand(n_attack, 3) * 0.2 + 0.8
+        train_data[:n_attack] = attack_rows
+        logger.info(f"[{client_id}] Byzantine mode — poisoned data injected.")
+
+    client = AURAFlowerClient(client_id, train_data, val_data)
+
+    print(f"\n[{client_id}] Connecting to FL server at {server_address} …")
+    print(f"[{client_id}] Network: {'ADVERSARIAL (Byzantine)' if is_byzantine else 'Normal'}")
+    print(f"[{client_id}] Local dataset: {n_samples} flow records  |  features: {feature_dim}")
+
+    fl.client.start_client(
+        server_address = server_address,
+        client         = client.to_client(),
+    )
+    print(f"[{client_id}] Federation complete. Local model updated.")
+
+
+# CLI entry point — called by run_federation_networked.py per-process
 if __name__ == "__main__":
-    print("=== AURA FL Client — Mock Test ===")
-    clients = create_mock_clients(n_clients=3)
-    for c in clients:
-        print(f"  Created: {c.client_id}  |  train={len(c.train_data)}")
-    print("✓ FL clients created.")
+    import argparse
+    parser = argparse.ArgumentParser(description="AURA FL Client (networked mode)")
+    parser.add_argument("--client-id",  required=True,  help="e.g. org_hospital_1")
+    parser.add_argument("--server",     default=cfg.FL_SERVER_ADDRESS, help="host:port")
+    parser.add_argument("--samples",    type=int, default=500)
+    parser.add_argument("--byzantine",  action="store_true", help="Adversarial client")
+    parser.add_argument("--network-sim",default="",   help="Simulated LAN CIDR (display only)")
+    args = parser.parse_args()
+
+    if args.network_sim:
+        print(f"[{args.client_id}] Simulated network: {args.network_sim}")
+
+    start_client(
+        client_id      = args.client_id,
+        server_address = args.server,
+        n_samples      = args.samples,
+        is_byzantine   = args.byzantine,
+    )

@@ -99,8 +99,8 @@ EMA_WARMUP_BATCHES = 50
 
 FL_SERVER_ADDRESS   = "localhost:8080"
 FL_NUM_ROUNDS       = 3          # 3 rounds for 3 clients — 1 hash per round on ledger
-FL_MIN_CLIENTS      = 2          # Minimum clients needed to start a round
-FL_MIN_AVAILABLE    = 2
+FL_MIN_CLIENTS      = 3          # Minimum clients needed to start a round
+FL_MIN_AVAILABLE    = 3          # All 3 orgs must be present before round 1
 
 # Krum: number of clients to select per round (must be ≤ total clients - 2)
 # Krum drops the m clients whose weight updates are most distant from the median.

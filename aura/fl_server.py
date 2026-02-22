@@ -224,6 +224,13 @@ class KrumFedAURA(FedAvg):
         self._model_version    = 0
         self._hash_history: List[dict] = []
 
+        # Clear the trusted registry at the start of each FL session so that
+        # only the current session's final hash is present (1 hash per run).
+        registry_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text("{}")
+        logger.info("[REGISTRY] Cleared — fresh FL session starting.")
+
         logger.info(
             f"KrumFedAURA strategy ready  |  "
             f"rounds={num_rounds}  timeout={round_timeout_sec}s  "
@@ -287,31 +294,38 @@ class KrumFedAURA(FedAvg):
         self._model_version += 1
         model_version_tag = f"v{self._model_version}.{server_round}"
 
-        # ── SHA-256 Hash ─────────────────────────────────────────────────────
+        # ── SHA-256 Hash (computed every round — clients verify weights) ──────
         model_hash = hash_model_weights(aggregated)
         print(f"{round_tag} Global Model {model_version_tag} aggregated.")
         print(f"{round_tag} SHA-256 hash: {model_hash}")
 
-        # ── Blockchain Audit Log ─────────────────────────────────────────────
-        if self.blockchain is not None:
-            try:
-                tx_hash = self.blockchain.log_model_update(
-                    model_version=model_version_tag,
-                    model_hash=model_hash,
-                )
-                print(f"[BLOCKCHAIN] Smart Contract Updated: Hash {model_hash[:12]}… "
-                      f"| TX: {str(tx_hash)[:16]}…")
-            except Exception as e:
-                logger.warning(f"Blockchain log failed (fallback active): {e}")
+        # ── Blockchain Audit Log (FINAL ROUND ONLY) ──────────────────────────
+        # Intermediate rounds converge the model; only the final aggregated
+        # model is production-ready and gets minted on the blockchain ledger.
+        is_final_round = (server_round == self.num_rounds)
+        if is_final_round:
+            final_version = f"final_v{self._model_version}"
+            if self.blockchain is not None:
+                try:
+                    tx_hash = self.blockchain.log_model_update(
+                        model_version=final_version,
+                        model_hash=model_hash,
+                    )
+                    print(f"[BLOCKCHAIN] Final Model {final_version} minted. "
+                          f"Hash {model_hash[:12]}… | TX: {str(tx_hash)[:16]}…")
+                except Exception as e:
+                    logger.warning(f"Blockchain log failed (fallback active): {e}")
+            else:
+                self._log_hash_local(final_version, model_hash, server_round)
+
+            # Write trusted registry — only for the final converged model
+            self._write_trusted_registry(final_version, model_hash)
+            model_version_tag = final_version
         else:
-            # Fallback: local hash file
-            self._log_hash_local(model_version_tag, model_hash, server_round)
+            print(f"{round_tag} Intermediate round — hash not minted yet "
+                  f"(blockchain mint on round {self.num_rounds} only).")
 
-        # ── Trusted Registry (ground-truth — separate from the ledger) ───────
-        # This file is written at aggregation time and acts as the
-        # tamper-detection reference in verify_chain.py.
-        self._write_trusted_registry(model_version_tag, model_hash)
-
+        # Expose which indices were selected so client_statuses can use it
         # Record in history (for dashboard display)
         self._hash_history.append({
             "round":   server_round,
@@ -325,10 +339,11 @@ class KrumFedAURA(FedAvg):
         self._save_model(aggregated, model_version_tag)
 
         return ndarrays_to_parameters(aggregated), {
-            "model_version": model_version_tag,
-            "model_hash":    model_hash,
-            "krum_selected": len(selected_indices),
-            "krum_dropped":  n_received - len(selected_indices),
+            "model_version":        model_version_tag,
+            "model_hash":           model_hash,
+            "krum_selected":        len(selected_indices),
+            "krum_selected_indices": selected_indices,
+            "krum_dropped":         n_received - len(selected_indices),
         }
 
     def _log_hash_local(self, version: str, model_hash: str, rnd: int) -> None:
@@ -425,7 +440,8 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
         n_rounds = cfg.FL_NUM_ROUNDS
 
     clients  = create_mock_clients(n_clients=3, n_samples=300)
-    strategy = KrumFedAURA(blockchain_module=blockchain_module)
+    strategy = KrumFedAURA(blockchain_module=blockchain_module,
+                           num_rounds=n_rounds)
 
     # Initialise with random global model
     global_model = AURAModelBundle()
@@ -458,7 +474,20 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
             results      = fit_results,
             failures     = [],
         )
-
+        # Build per-client status for dashboard display
+        selected_idx = metrics.get('krum_selected_indices', [])
+        client_statuses = []
+        for i, client in enumerate(clients):
+            is_selected = (selected_idx and i in selected_idx)
+            is_byzantine = (i == 1)   # index 1 is always the adversarial client
+            client_statuses.append({
+                "client_id":  client.client_id,
+                "network":    ["192.168.1.0/24", "10.0.1.0/24", "172.16.1.0/24"][i],
+                "org":        ["Hospital", "Bank", "University"][i],
+                "role":       "Byzantine" if is_byzantine else "Normal",
+                "selected":   is_selected if selected_idx else (not is_byzantine),
+                "round":      rnd,
+            })
         if new_params is not None:
             global_params = parameters_to_ndarrays(new_params)
             model_version = metrics.get('model_version')
@@ -470,32 +499,37 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
             print()
 
             # ── Client-side hash verification ────────────────────────────────────
-            # Each client receives the weights, recomputes SHA-256 of what it
-            # received, then fetches the server-minted hash from blockchain and
-            # compares. Mismatch = weights were tampered in transit.
-            client_received_hash = hash_model_weights(global_params)
+            # Hash verification only makes sense on the final round, because the
+            # blockchain is only minted once (at the end of federation).
+            # On intermediate rounds we print the computed hash for auditing only.
+            is_final = model_version and model_version.startswith("final_")
+            if is_final:
+                client_received_hash = hash_model_weights(global_params)
 
-            for client in clients:
-                # Fetch the hash the server minted for this version
-                bc = blockchain_module
-                if bc is not None:
-                    on_chain_ok, _ = bc.verify_model(model_version, client_received_hash)
-                else:
-                    # No blockchain — compare directly against server hash
-                    on_chain_ok = (client_received_hash == server_hash)
+                for client in clients:
+                    # Fetch the hash the server minted for this version
+                    bc = blockchain_module
+                    if bc is not None:
+                        on_chain_ok, _ = bc.verify_model(model_version, client_received_hash)
+                    else:
+                        # No blockchain — compare directly against server hash
+                        on_chain_ok = (client_received_hash == server_hash)
 
-                if on_chain_ok:
-                    print(f"  [CLIENT {client.client_id}] "
-                          f"Received hash {client_received_hash[:16]}... "
-                          f"== Blockchain hash {server_hash[:16]}... "
-                          f"→ MATCH. Model deployed.")
-                else:
-                    print(f"  [CLIENT {client.client_id}] "
-                          f"Received hash {client_received_hash[:16]}... "
-                          f"!= Blockchain hash {server_hash[:16]}... "
-                          f"→ MISMATCH! Weights tampered in transit. REJECTING model.")
+                    if on_chain_ok:
+                        print(f"  [CLIENT {client.client_id}] "
+                              f"Received hash {client_received_hash[:16]}... "
+                              f"== Blockchain hash {server_hash[:16]}... "
+                              f"→ MATCH. Model deployed.")
+                    else:
+                        print(f"  [CLIENT {client.client_id}] "
+                              f"Received hash {client_received_hash[:16]}... "
+                              f"!= Blockchain hash {server_hash[:16]}... "
+                              f"→ MISMATCH! Weights tampered in transit. REJECTING model.")
+            else:
+                print(f"  [CLIENTS] Intermediate round — blockchain not yet minted. "
+                      f"Hash {server_hash[:20]}... recorded locally for auditing.")
 
-        round_results.append({"round": rnd, **metrics})
+        round_results.append({"round": rnd, "client_statuses": client_statuses, **metrics})
 
     print(f"\n{'='*55}")
     print(f"  Federation complete.  {n_rounds} rounds executed.")
@@ -505,8 +539,55 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None) -> L
 
 
 if __name__ == "__main__":
-    print("=== AURA Federation — Simulation Mode ===")
-    results = run_federation_simulation()
-    for r in results:
-        print(f"  Round {r['round']}: {r.get('model_version')}  hash={r.get('model_hash', 'N/A')[:18]}…")
-    print("✓ Federation simulation complete.")
+    import argparse
+    parser = argparse.ArgumentParser(description="AURA FL Aggregation Server")
+    parser.add_argument(
+        "--address", default=cfg.FL_SERVER_ADDRESS,
+        help="gRPC bind address (default: %(default)s). "
+             "Use 0.0.0.0:8080 to accept remote clients."
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=cfg.FL_NUM_ROUNDS,
+        help="Number of FL rounds (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--simulate", action="store_true",
+        help="Run in-process simulation instead of gRPC server (legacy mode)"
+    )
+    args = parser.parse_args()
+
+    if args.simulate:
+        print("=== AURA Federation — In-Process Simulation Mode ===")
+        results = run_federation_simulation(n_rounds=args.rounds)
+        for r in results:
+            print(f"  Round {r['round']}: {r.get('model_version')}  "
+                  f"hash={r.get('model_hash', 'N/A')[:18]}…")
+        print("✓ Federation simulation complete.")
+    else:
+        # TRUE NETWORKED MODE — waits for real gRPC client connections
+        from aura.blockchain import AURABlockchainLogger
+        bc = AURABlockchainLogger()
+
+        strategy = KrumFedAURA(
+            blockchain_module = bc,
+            num_rounds        = args.rounds,
+        )
+        server_config = fl.server.ServerConfig(
+            num_rounds    = args.rounds,
+            round_timeout = cfg.FL_ROUND_TIMEOUT_SEC,
+        )
+
+        print(f"\n{'='*62}")
+        print(f"  AURA Federation Server — NETWORKED MODE")
+        print(f"  Binding on:  {args.address}")
+        print(f"  Rounds:      {args.rounds}")
+        print(f"  Strategy:    Krum (Byzantine-robust, select {cfg.KRUM_NUM_TO_SELECT})")
+        print(f"  Waiting for {cfg.FL_MIN_AVAILABLE} clients to connect …")
+        print(f"{'='*62}\n")
+
+        fl.server.start_server(
+            server_address = args.address,
+            config         = server_config,
+            strategy       = strategy,
+        )
+
