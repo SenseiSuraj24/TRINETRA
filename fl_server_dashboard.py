@@ -32,6 +32,30 @@ def _read_readiness() -> dict:
     except Exception:
         return {}
 
+def _write_readiness_server(org_key: str, under_attack: bool) -> None:
+    """
+    Server-side write to fl_readiness.json.
+    Called automatically when Krum detects a Byzantine client so the org
+    dashboard reflects quarantine status without any manual button press.
+    """
+    try:
+        _READINESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        rd: dict = {}
+        if _READINESS_FILE.exists():
+            try:
+                rd = json.loads(_READINESS_FILE.read_text())
+            except Exception:
+                rd = {}
+        entry = dict(rd.get(org_key, {}))
+        entry["under_attack"] = under_attack
+        if under_attack:
+            entry["ready"] = False   # force not-ready while quarantined
+        entry["ts"] = time.time()
+        rd[org_key] = entry
+        _READINESS_FILE.write_text(json.dumps(rd, indent=2))
+    except Exception:
+        pass  # non-critical — federation continues regardless
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Theme
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,17 +283,18 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         _qid = {"hospital": "org_hospital_1", "bank": "org_bank_2", "university": "org_university_3"}[_qk]
         st.session_state["client_cards"][_qid]["status"] = "quarantined"
 
-    # Attack is tied to BANK org — only if bank is active (not quarantined/offline).
-    # If bank is quarantined it's already excluded from active_orgs above, so no
-    # poisoned data enters FL at all. If bank is active we still inject its
-    # compromised data so Krum can demonstrate detection against a real signal.
-    if "bank" in active_orgs:
-        bank_idx = active_orgs.index("bank")
-        attack_client_arg = bank_idx
-        attack_org = "bank"
+    # ── Randomly inject attack into one active org so Krum has a real signal ───
+    # Every FL run the server secretly poisons one participating org's training
+    # data. Krum's job is to detect the outlier and drop it. The chosen org is
+    # random each run so no org is always flagged. After detection the server
+    # auto-quarantines that org via _write_readiness_server.
+    import random as _rand
+    if len(active_orgs) >= 2:
+        attack_org        = _rand.choice(active_orgs)
+        attack_client_arg = active_orgs.index(attack_org)
     else:
-        attack_client_arg = -1   # bank offline → no poisoning this run
-        attack_org = None
+        attack_org        = None
+        attack_client_arg = -1   # only 1 org — nothing to compare, skip attack
 
     clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
@@ -280,10 +305,10 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     st.session_state["byzantine_org"] = None
     st.session_state["attack_idx"]    = attack_idx
     if attack_org:
-        _log(f"\U0001f9a0 Attack data injected into: BANK (index {attack_idx}) "
-             f"\u2014 Krum will attempt to detect this outlier")
+        _log(f"\U0001f9a0 [SERVER] Attack data secretly injected into: {attack_org.upper()} "
+             f"\u2014 Krum will attempt to identify and drop this outlier")
     else:
-        _log("\u2705 Bank is offline \u2014 all active orgs are honest this run")
+        _log("\u2705 Single active org \u2014 skipping attack injection this run")
 
     # Pass the live client count so aggregate_fit's quorum check never
     # abandons rounds when fewer than 3 orgs are active (e.g. one quarantined).
@@ -377,6 +402,16 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             st.session_state["byzantine_org"] = krum_byz_org
         else:
             krum_byz_org = None
+
+        # ── Server AI Auto-Quarantine ─────────────────────────────────────
+        # Krum detected an outlier → server immediately writes under_attack=True
+        # back to fl_readiness.json.  The org's own dashboard will pick this up
+        # on its next render cycle — no manual "Report Under Attack" needed.
+        if krum_byz_org and krum_byz_org not in quarantined:
+            _write_readiness_server(krum_byz_org, under_attack=True)
+            _log(f"  [SERVER-AI] ⚡ Auto-quarantined {krum_byz_org.upper()} "
+                 f"— Krum flagged Byzantine behaviour. "
+                 f"Org is blocked from next FL run until attack ends.")
 
         # Did Krum correctly catch the poisoned client?
         _atk_idx = st.session_state.get("attack_idx")

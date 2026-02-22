@@ -149,7 +149,7 @@ def _init_state():
         if _rf.exists():
             try:
                 _rd = json.loads(_rf.read_text())
-                defaults["fl_ready"]     = _rd.get(_ORG_KEY, {}).get("ready", False)
+                defaults["fl_ready"]    = _rd.get(_ORG_KEY, {}).get("ready",        False)
                 defaults["under_attack"] = _rd.get(_ORG_KEY, {}).get("under_attack", False)
             except Exception:
                 pass
@@ -762,10 +762,29 @@ with ctrl_fl:
                 unsafe_allow_html=True)
 
     # ── FL Readiness Toggle ──────────────────────────────────────────────────
-    _ready = st.session_state.get("fl_ready", False)
+    # Poll fl_readiness.json every render so server-written attack status
+    # (set automatically by Krum detection) is reflected immediately.
+    if ORG:
+        _rf_poll = Path(cfg.LOGS_DIR) / "fl_readiness.json"
+        if _rf_poll.exists():
+            try:
+                _rd_poll = json.loads(_rf_poll.read_text())
+                _srv_atk  = _rd_poll.get(_ORG_KEY, {}).get("under_attack", False)
+                _srv_rdy  = _rd_poll.get(_ORG_KEY, {}).get("ready",        False)
+                if _srv_atk != st.session_state.get("under_attack", False):
+                    st.session_state["under_attack"] = _srv_atk
+                    st.session_state["fl_ready"]     = _srv_rdy
+            except Exception:
+                pass
+
+    _ready        = st.session_state.get("fl_ready",     False)
     _under_attack = st.session_state.get("under_attack", False)
-    _ready_color  = THEME["green"]  if (_ready and not _under_attack) else (THEME["red"] if _under_attack else THEME["dim"])
-    _ready_status = "🚨 UNDER ATTACK — QUARANTINED" if _under_attack else ("🟢 READY" if _ready else "🔴 NOT READY")
+    _ready_color  = THEME["green"] if (_ready and not _under_attack) \
+                    else (THEME["red"] if _under_attack else THEME["dim"])
+    _ready_status = (
+        "🚨 UNDER ATTACK — QUARANTINED" if _under_attack
+        else ("🟢 READY" if _ready else "🔴 NOT READY")
+    )
 
     st.markdown(
         f"<div style='background:{THEME['panel']}; border:1px solid {_ready_color}; "
@@ -797,25 +816,29 @@ with ctrl_fl:
             }
             _rf.write_text(_json.dumps(_rd, indent=2))
 
-    _atk_btn_label = "✅ Attack Ended — Resume" if _under_attack else "🚨 Report Under Attack"
-    _atk_btn_type  = "primary" if _under_attack else "secondary"
-    _toggle_label  = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
+    _toggle_label = "✅ Mark as Ready" if not _ready else "⏸ Mark as Not Ready"
 
-    _fl_col, _atk_col = st.columns(2)
-    with _fl_col:
-        if st.button(_toggle_label, use_container_width=True, disabled=_under_attack):
+    if _under_attack:
+        # Server AI auto-quarantined this org — admin clears it when issue resolved.
+        st.markdown(
+            f"<div style='background:{THEME['panel']}; border:1px solid {THEME['red']}; "
+            f"border-radius:8px; padding:0.5rem 0.8rem; margin-bottom:0.4rem; "
+            f"font-size:0.85em; color:{THEME['red']};'>"
+            f"⚡ <b>Suspicious behaviour detected by FL Server (Krum).</b> "
+            f"This org is quarantined until the issue is resolved."
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("✅ Issue Resolved — Resume", use_container_width=True, type="primary"):
+            st.session_state["under_attack"] = False
+            st.session_state["fl_ready"]     = False
+            _write_readiness(False, False)
+            st.rerun()
+    else:
+        if st.button(_toggle_label, use_container_width=True):
             new_ready = not _ready
             st.session_state["fl_ready"] = new_ready
-            _write_readiness(new_ready, _under_attack)
-            st.rerun()
-    with _atk_col:
-        if st.button(_atk_btn_label, use_container_width=True, type=_atk_btn_type):
-            new_attack = not _under_attack
-            st.session_state["under_attack"] = new_attack
-            # Under attack forces not-ready; attack ended restores previous ready state
-            new_ready = False if new_attack else _ready
-            st.session_state["fl_ready"] = new_ready
-            _write_readiness(new_ready, new_attack)
+            _write_readiness(new_ready, False)
             st.rerun()
 
     # ── Client Status Table ──────────────────────────────────────────────────
