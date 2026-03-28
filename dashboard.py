@@ -1140,7 +1140,7 @@ with ctrl_fl:
 
     # ── FL Readiness Toggle ──────────────────────────────────────────────────
     # Poll fl_readiness.json every render so server-written attack status
-    # (set automatically by Krum detection) is reflected immediately.
+    # (set automatically by FLTrust / server detection) is reflected immediately.
     if ORG:
         _rf_poll = Path(cfg.LOGS_DIR) / "fl_readiness.json"
         if _rf_poll.exists():
@@ -1201,7 +1201,7 @@ with ctrl_fl:
             f"<div style='background:{THEME['panel']}; border:1px solid {THEME['red']}; "
             f"border-radius:8px; padding:0.5rem 0.8rem; margin-bottom:0.4rem; "
             f"font-size:0.85em; color:{THEME['red']};'>"
-            f"⚡ <b>Suspicious behaviour detected by FL Server (Krum).</b> "
+            f"⚡ <b>Suspicious behaviour detected by FL Server (FLTrust).</b> "
             f"This org is quarantined until the issue is resolved."
             f"</div>",
             unsafe_allow_html=True,
@@ -1266,7 +1266,7 @@ with ctrl_fl:
             f"<th style='text-align:left; padding:2px 6px'>Org</th>"
             f"<th style='text-align:left; padding:2px 6px'>Network</th>"
             f"<th style='text-align:left; padding:2px 6px'>Role</th>"
-            f"<th style='text-align:left; padding:2px 6px'>Krum</th>"
+            f"<th style='text-align:left; padding:2px 6px'>FLTrust</th>"
             f"</tr></thead>"
             f"<tbody>{rows_html}</tbody>"
             f"</table></div>",
@@ -1419,7 +1419,7 @@ with st.sidebar:
        GraphSAGE (inductive)  
        Topology anomaly scoring
 
-    4. **Federation** — Krum aggregation  
+    4. **Federation** — FLTrust aggregation  
        Byzantine-robust FL  
        Straggler timeout policy
 
