@@ -14,7 +14,7 @@ Architecture
   │                                                                 │
   │  [Process 0 — FL Server]   0.0.0.0:8080                        │
   │      KrumFedAURA strategy                                       │
-  │      Byzantine-robust FLTrust aggregation                       │
+  │      Byzantine-robust Krum aggregation                          │
   │      SHA-256 → Blockchain mint (final round only)               │
   │                    ▲  ▲  ▲                                      │
   │                    │  │  │  (gRPC over loopback / LAN)          │
@@ -32,7 +32,7 @@ Flow
 1. Server starts, waits for MIN_AVAILABLE_CLIENTS to connect
 2. Each client dials the server via gRPC (separate process / could be
    a separate machine — just change --server to the remote IP)
-3. Server runs FLTrust aggregation each round — org_bank_2 (Byzantine) is
+3. Server runs Krum selection each round — org_bank_2 (Byzantine) is
    consistently dropped; hospital + university weights are aggregated
 4. Final round: SHA-256(aggregated weights) minted on blockchain once
 5. Each client verifies received weights against the on-chain hash

@@ -14,9 +14,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR   = Path(__file__).parent.resolve()
-# Relative dataset root — apostrophe must match the real folder name on disk.
-DATA_DIR   = "CSV's/MachineLearningCVE"
-CSV_DIR    = BASE_DIR / DATA_DIR
+CSV_DIR    = BASE_DIR / "CSV's" / "MachineLearningCVE"
 MODELS_DIR = BASE_DIR / "saved_models"
 LOGS_DIR   = BASE_DIR / "logs"
 CONTRACTS_DIR = BASE_DIR / "contracts"
@@ -24,9 +22,6 @@ CONTRACTS_DIR = BASE_DIR / "contracts"
 # Ensure output dirs exist
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Primary bundle path written by train.py (for health checks / tooling)
-MODEL_SAVE_PATH = str(MODELS_DIR / "aura_bundle.pth")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATASET
@@ -113,7 +108,7 @@ K_CONSECUTIVE_READINGS  = 5     # configurable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEDERATED LEARNING (Flower + FLTrust aggregation; legacy distance helpers in fl_server.py)
+# FEDERATED LEARNING (Flower + Krum Aggregation)
 # ─────────────────────────────────────────────────────────────────────────────
 
 FL_SERVER_ADDRESS   = "localhost:8080"
@@ -121,15 +116,15 @@ FL_NUM_ROUNDS       = 3          # 3 rounds for 3 clients — 1 hash per round o
 FL_MIN_CLIENTS      = 3          # Minimum clients needed to start a round
 FL_MIN_AVAILABLE    = 3          # All 3 orgs must be present before round 1
 
-# Legacy distance-based selection sizing only (krum_select fallback — not used by FLTrust aggregate_fit).
-# When that legacy path runs, the most outlying client updates are not selected (must be ≤ total clients - 2).
+# Krum: number of clients to select per round (must be ≤ total clients - 2)
+# Krum drops the m clients whose weight updates are most distant from the median.
 KRUM_NUM_TO_SELECT  = 2          # Select 2 from 3 mock clients (drops 1 straggler)
 
 # Straggler policy: if a client doesn't respond within this many seconds, drop it
 FL_ROUND_TIMEOUT_SEC = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLTRUST AGGREGATION (primary server aggregation — Upgrade 6)
+# FLTRUST AGGREGATION (replaces Krum — Upgrade 6)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Number of synthetic benign samples the server holds as its trusted root dataset.
@@ -238,8 +233,8 @@ FEATURE_INDEX_MAP: dict = {
 # MSE severity thresholds for custom injection events.
 # These values are calibrated to the current AE's reconstruction error scale.
 # Raise MSE_THRESHOLD_HIGH to require stronger anomaly evidence for HIGH tier.
-MSE_THRESHOLD_HIGH   = 0.165745   # P99 benign MSE (calibrate_thresholds.py)
-MSE_THRESHOLD_MEDIUM = 0.163982   # P90 benign MSE (calibrate_thresholds.py)
+MSE_THRESHOLD_HIGH   = 0.7   # MSE above this → AlertSeverity.HIGH
+MSE_THRESHOLD_MEDIUM = 0.4   # MSE above this → AlertSeverity.MEDIUM  (else LOW)
 
 # Corruption profiles for each simulated attack type.
 # Each profile maps feature-group names to their corruption ranges:

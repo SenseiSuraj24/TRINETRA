@@ -23,7 +23,7 @@ bound to the exact model bytes, even a 1-bit change in weights is
 detected instantly with zero false negatives.
 
 Note on "Blockchain" vs "Audit Log":
-  This is NOT using blockchain as a poisoning defence (FLTrust handles gradient trust).
+  This is NOT using blockchain as a poisoning defence (Krum handles that).
   This is NON-REPUDIATION: the server cannot claim it sent a different model
   than what was actually deployed, because the hash is in the immutable ledger.
 
