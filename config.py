@@ -94,6 +94,20 @@ EMA_SIGMA_MULTIPLIER = 3.0
 EMA_WARMUP_BATCHES = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SEVERITY ENGINE — Temporal Accumulator + EMA Trajectory
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rolling window for per-node event accumulation (seconds).
+# Events older than this are purged before escalation rules are evaluated.
+TEMPORAL_WINDOW_SECONDS = 300   # 5 minutes — configurable
+
+# EMA trajectory persistence threshold.
+# K consecutive readings above 2.0σ → MEDIUM floor.
+# K consecutive readings above 2.5σ → HIGH floor.
+K_CONSECUTIVE_READINGS  = 5     # configurable
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FEDERATED LEARNING (Flower + Krum Aggregation)
 # ─────────────────────────────────────────────────────────────────────────────
 

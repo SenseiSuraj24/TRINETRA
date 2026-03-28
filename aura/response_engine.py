@@ -41,6 +41,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as cfg
 from aura.detector import AnomalyEvent, AlertSeverity
+import policy_engine
 
 logger = logging.getLogger(__name__)
 
@@ -227,21 +228,22 @@ class AURAResponseEngine:
         reason: str = None
     ) -> IncidentRecord:
         simulated_ip = f"10.0.0.{hash(node_id) % 254 + 1}"
+        asset_class  = "CRITICAL" if is_critical else "STANDARD"
 
-        # Linux tc command to throttle to 10 kbps (chokes exfiltration)
-        tc_cmd = (
-            f"tc qdisc add dev eth0 root handle 1: htb default 12 && "
-            f"tc class add dev eth0 parent 1: classid 1:1 htb rate 10kbps && "
-            f"tc filter add dev eth0 protocol ip parent 1:0 prio 1 "
-            f"u32 match ip src {simulated_ip} flowid 1:1"
+        # Delegate to policy engine — runs scripts/throttle.sh (or simulates on Windows)
+        command = policy_engine.execute_response(
+            severity     = "MEDIUM",
+            asset_class  = asset_class,
+            node_id      = node_id,
+            node_label   = node_label,
+            simulated_ip = simulated_ip,
+            confidence   = event.confidence,
         )
-        command = tc_cmd if not self.IS_WINDOWS else f"[SIMULATED-TC] {tc_cmd}"
-        self._execute_command(command)
 
         if reason is None:
             reason = (
                 f"Confidence {event.confidence:.2%} ≥ {cfg.CONFIDENCE_MED_THRESHOLD:.2%}. "
-                f"Bandwidth throttled to 10 kbps.  HITL analyst alert sent."
+                f"Bandwidth throttled via policy engine.  HITL analyst alert sent."
             )
 
         logger.warning(
@@ -260,22 +262,35 @@ class AURAResponseEngine:
     ) -> IncidentRecord:
         simulated_ip = f"10.0.0.{hash(node_id) % 254 + 1}"
 
-        # iptables rule: drop all packets from infected IP
-        ipt_cmd = f"iptables -A INPUT -s {simulated_ip} -j DROP && iptables -A OUTPUT -d {simulated_ip} -j DROP"
-        command = ipt_cmd if not self.IS_WINDOWS else f"[SIMULATED-IPTABLES] {ipt_cmd}"
-        self._execute_command(command)
+        # Delegate to policy engine — presents HITL gate before running scripts/isolate.sh.
+        # If HITL is rejected, policy_engine automatically degrades to scripts/throttle.sh
+        # and logs the rejection + fallback with timestamp. Node always exits controlled.
+        command = policy_engine.execute_response(
+            severity     = "HIGH",
+            asset_class  = "STANDARD",
+            node_id      = node_id,
+            node_label   = node_label,
+            simulated_ip = simulated_ip,
+            confidence   = event.confidence,
+        )
+
+        # Determine actual action taken based on what the policy engine ran
+        actual_action = (
+            ResponseAction.THROTTLE if "throttle" in command.lower()
+            else ResponseAction.ISOLATE
+        )
 
         reason = (
             f"HIGH confidence ({event.confidence:.2%}) on Non-Critical asset. "
-            f"Node mathematically amputated from network map.  "
+            f"Policy engine executed: {actual_action.value}. "
             f"Lateral movement blast radius contained."
         )
         logger.critical(
-            f"[FULL ISOLATION] {node_id} ({node_label}) | IP={simulated_ip} | {reason}"
+            f"[{actual_action.value}] {node_id} ({node_label}) | IP={simulated_ip} | {reason}"
         )
         return self._write_record(
             event, node_id, node_label, is_critical,
-            action=ResponseAction.ISOLATE,
+            action=actual_action,
             reason=reason, command=command,
         )
 

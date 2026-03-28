@@ -557,5 +557,6 @@ The following improvements are acknowledged as out-of-scope for the hackathon bu
 
 | Date | Author | Change |
 |---|---|---|
-| 2026-03-28 | Antigravity (AI) | Initial `implementation.md` created — full ground-truth documentation from source read |
+| 2026-03-28 | Antigravity (AI) | **Upgrade 1** — Added `policy_engine.py`, `response_policy.yaml`, `scripts/{isolate,throttle,log_only}.sh`. Replaced hardcoded `tc`/`iptables` calls in `response_engine.py` with `policy_engine.execute_response()`. HITL gate enforced: isolation requires `y`; any other input auto-degrades to throttle. `pyyaml` added to `requirements.txt`. |
+| 2026-03-28 | Antigravity (AI) | **Severity Engine Upgrade** — `config.py`: added `TEMPORAL_WINDOW_SECONDS=300`, `K_CONSECUTIVE_READINGS=5`. `detector.py`: (1) `EMAThresholdTracker` — added `threshold_2sigma`/`threshold_2_5sigma` properties, trajectory counters `_consecutive_above_2sigma`/`_consecutive_above_2_5sigma` updated in `update()`, exposed in `state_dict()`; (2) `AURAInferenceEngine` — EMA computed before `l1_triggered` (EMA-first order), trajectory-triggered events invoke L2 GNN, `_classify_severity()` accepts `consec_2sigma`/`consec_2_5sigma` and floors severity via trajectory, `_apply_temporal_escalation()` adds per-node sliding window accumulator with LOW×3→MEDIUM, LOW×5 or MED×3→HIGH escalation rules and HIGH-event window reset. |
 | | | |

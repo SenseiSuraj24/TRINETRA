@@ -35,6 +35,7 @@ import logging
 import math
 import json
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -133,6 +134,10 @@ class EMAThresholdTracker:
         self._ema_mean: Optional[float] = None
         self._ema_var:  Optional[float] = None
 
+        # Trajectory counters — consecutive readings above soft sigma levels
+        self._consecutive_above_2sigma:   int = 0
+        self._consecutive_above_2_5sigma: int = 0
+
     @property
     def ema_std(self) -> float:
         if self._ema_var is None:
@@ -141,15 +146,34 @@ class EMAThresholdTracker:
 
     @property
     def threshold(self) -> float:
-        """Current dynamic alert threshold.  Returns inf during warmup."""
+        """Current 3σ hard UCL threshold. Returns inf during warmup."""
         if self.batch_count < self.warmup_batches or self._ema_mean is None:
             return float('inf')
         return self._ema_mean + self.sigma_multiplier * self.ema_std
 
+    @property
+    def threshold_2sigma(self) -> float:
+        """EMA_mean + 2.0σ — soft trajectory alert level. Returns inf during warmup."""
+        if self.batch_count < self.warmup_batches or self._ema_mean is None:
+            return float('inf')
+        return self._ema_mean + 2.0 * self.ema_std
+
+    @property
+    def threshold_2_5sigma(self) -> float:
+        """EMA_mean + 2.5σ — elevated trajectory alert level. Returns inf during warmup."""
+        if self.batch_count < self.warmup_batches or self._ema_mean is None:
+            return float('inf')
+        return self._ema_mean + 2.5 * self.ema_std
+
     def update(self, loss: float) -> float:
         """
         Process a new batch loss value.  Updates EMA state and returns the
-        current threshold AFTER incorporating this new observation.
+        current 3σ threshold AFTER incorporating this new observation.
+
+        Also updates trajectory counters:
+          _consecutive_above_2sigma   — incremented when loss > EMA_mean + 2.0σ
+          _consecutive_above_2_5sigma — incremented when loss > EMA_mean + 2.5σ
+          Both reset to 0 when the respective sigma level is not exceeded.
         """
         self.batch_count += 1
 
@@ -166,21 +190,41 @@ class EMAThresholdTracker:
             # σ²_t = (1−α)·(σ²_{t−1} + α·δ²)
             self._ema_var   = (1 - self.alpha) * (self._ema_var + self.alpha * delta ** 2)
 
+        # ── Trajectory tracking (post-warmup only) ────────────────────────────
+        if self.batch_count >= self.warmup_batches and self._ema_mean is not None:
+            t2_5 = self.threshold_2_5sigma
+            t2_0 = self.threshold_2sigma
+            if not math.isinf(t2_5) and loss > t2_5:
+                # Above 2.5σ: both counters increment (2.5σ implies 2.0σ)
+                self._consecutive_above_2_5sigma += 1
+                self._consecutive_above_2sigma   += 1
+            elif not math.isinf(t2_0) and loss > t2_0:
+                # Between 2.0σ and 2.5σ: only 2σ counter increments
+                self._consecutive_above_2sigma   += 1
+                self._consecutive_above_2_5sigma  = 0
+            else:
+                # Below 2.0σ: both counters reset
+                self._consecutive_above_2sigma    = 0
+                self._consecutive_above_2_5sigma  = 0
+
         return self.threshold
 
     def is_anomalous(self, loss: float) -> bool:
         """
-        Check if `loss` exceeds the CURRENT threshold (before updating).
-        Call update() separately to advance the EMA state.
+        Check if `loss` exceeds the CURRENT 3σ threshold (before updating).
+        Retained for external callers and unit tests.  The inference engine
+        now calls update() first and evaluates l1_triggered separately.
         """
         return self.batch_count >= self.warmup_batches and loss > self.threshold
 
     def state_dict(self) -> dict:
         return {
-            "batch_count": self.batch_count,
-            "ema_mean":    self._ema_mean,
-            "ema_var":     self._ema_var,
-            "alpha":       self.alpha,
+            "batch_count":              self.batch_count,
+            "ema_mean":                 self._ema_mean,
+            "ema_var":                  self._ema_var,
+            "alpha":                    self.alpha,
+            "consecutive_above_2sigma":   self._consecutive_above_2sigma,
+            "consecutive_above_2_5sigma": self._consecutive_above_2_5sigma,
         }
 
 
@@ -252,6 +296,10 @@ class AURAInferenceEngine:
         self.device      = device
         self._event_log: List[AnomalyEvent] = []
 
+        # Per-node temporal accumulator: {node_id: [(unix_ts, AlertSeverity), ...]}
+        # Used by _apply_temporal_escalation to detect sustained repeated flags.
+        self._node_event_window: Dict[str, List[tuple]] = defaultdict(list)
+
         logger.info("AURAInferenceEngine initialised (device=%s).", device)
 
     def process(
@@ -280,9 +328,19 @@ class AURAInferenceEngine:
         ae_scores = self.ae.anomaly_score(edge_attr)      # [E]
         batch_mse = float(ae_scores.mean())
 
-        # Check BEFORE update so threshold reflects history, not current batch
-        l1_triggered = self.ema.is_anomalous(batch_mse)
+        # EMA is updated FIRST so severity is determined after full computation.
+        # l1_triggered = True on either:
+        #   (a) hard UCL breach: batch_mse > 3σ threshold, OR
+        #   (b) trajectory persistence: K consecutive readings above 2.0σ or 2.5σ
         current_threshold = self.ema.update(batch_mse)
+        l1_triggered = (
+            not math.isinf(current_threshold)
+            and (
+                batch_mse > current_threshold
+                or self.ema._consecutive_above_2_5sigma >= cfg.K_CONSECUTIVE_READINGS
+                or self.ema._consecutive_above_2sigma   >= cfg.K_CONSECUTIVE_READINGS
+            )
+        )
         # ── Feature Attribution & Attack Classification (when L1 fires) ───
         top_features    = []
         inferred_attack = "Normal"
@@ -320,7 +378,14 @@ class AURAInferenceEngine:
             gnn_scores=gnn_scores,
         )
 
-        severity = self._classify_severity(l1_triggered, confidence, triggered_nodes)
+        # Base severity: instantaneous score + EMA trajectory
+        severity = self._classify_severity(
+            l1_triggered, confidence, triggered_nodes,
+            consec_2sigma   = self.ema._consecutive_above_2sigma,
+            consec_2_5sigma = self.ema._consecutive_above_2_5sigma,
+        )
+        # Temporal escalation: sustained repeated flags per node raise severity
+        severity = self._apply_temporal_escalation(severity, triggered_nodes)
 
         # Ground truth ratio for dashboard metrics
         gt_ratio = 0.0
@@ -359,25 +424,119 @@ class AURAInferenceEngine:
         l1_triggered:    bool,
         confidence:      float,
         triggered_nodes: List[int],
+        consec_2sigma:   int = 0,
+        consec_2_5sigma: int = 0,
     ) -> AlertSeverity:
         """
-        3-tier classification:
-          LOW    : L1 triggered but confidence < MED_THRESHOLD
-          MEDIUM : L1 triggered, confidence ≥ MED_THRESHOLD but < 1.0
-                   OR no GNN nodes flagged (ambiguous)
-          HIGH   : L1 + L2 both confirm,  confidence ≥ MED_THRESHOLD
-                   AND ≥1 specific node flagged
+        Severity is a function of TWO independent inputs:
+
+        1. Instantaneous MSE reconstruction error (via confidence + triggered_nodes):
+             LOW    : L1 triggered, confidence < CONFIDENCE_LOW_THRESHOLD
+             MEDIUM : L1 triggered, confidence ≥ LOW but < MED, or no GNN nodes
+             HIGH   : L1 + L2 confirm, confidence ≥ MED, ≥1 GNN node flagged
+
+        2. EMA trajectory persistence (consec_2sigma / consec_2_5sigma):
+             consec_2sigma   ≥ K → floor severity to at least MEDIUM
+             consec_2_5sigma ≥ K → floor severity to at least HIGH
+
+        Either condition is sufficient to produce a given severity level.
+        Trajectory can only RAISE severity, never lower it.
         """
         if not l1_triggered:
             return AlertSeverity.NORMAL
 
+        # ── Instantaneous classification ──────────────────────────────────
         if confidence < cfg.CONFIDENCE_LOW_THRESHOLD:
-            return AlertSeverity.LOW
+            base = AlertSeverity.LOW
+        elif confidence < cfg.CONFIDENCE_MED_THRESHOLD or not triggered_nodes:
+            base = AlertSeverity.MEDIUM
+        else:
+            base = AlertSeverity.HIGH
 
-        if confidence < cfg.CONFIDENCE_MED_THRESHOLD or not triggered_nodes:
-            return AlertSeverity.MEDIUM
+        # ── EMA trajectory override (can only raise severity) ─────────────
+        K = cfg.K_CONSECUTIVE_READINGS
+        if consec_2_5sigma >= K and base.value < AlertSeverity.HIGH.value:
+            logger.info(
+                f"[EMA-TRAJ] {consec_2_5sigma} consecutive readings above 2.5σ "
+                f"→ escalating {base.name} → HIGH"
+            )
+            base = AlertSeverity.HIGH
+        elif consec_2sigma >= K and base.value < AlertSeverity.MEDIUM.value:
+            logger.info(
+                f"[EMA-TRAJ] {consec_2sigma} consecutive readings above 2.0σ "
+                f"→ escalating {base.name} → MEDIUM"
+            )
+            base = AlertSeverity.MEDIUM
 
-        return AlertSeverity.HIGH
+        return base
+
+    def _apply_temporal_escalation(
+        self,
+        base_severity:   AlertSeverity,
+        triggered_nodes: List[int],
+    ) -> AlertSeverity:
+        """
+        Per-node sliding window accumulator — escalates severity based on
+        sustained repeated flags within TEMPORAL_WINDOW_SECONDS.
+
+        Escalation rules (evaluated per triggered node):
+          low_count >= 3              → escalate to at least MEDIUM
+          low_count >= 5 OR
+          medium_count >= 3           → escalate to HIGH
+
+        The window is purged of entries older than TEMPORAL_WINDOW_SECONDS
+        before evaluation.  After a HIGH severity event, the accumulator for
+        that node is reset — a resolved incident must not poison future windows.
+
+        NORMAL events are never accumulated and bypass this method entirely.
+        """
+        if base_severity == AlertSeverity.NORMAL:
+            return AlertSeverity.NORMAL
+
+        now = time.time()
+        cutoff = now - cfg.TEMPORAL_WINDOW_SECONDS
+
+        # Use 'global' as the key when no specific nodes are identified
+        node_keys = [f"node_{n}" for n in triggered_nodes] if triggered_nodes else ["global"]
+        escalated = base_severity
+
+        for node_key in node_keys:
+            # Purge stale entries
+            self._node_event_window[node_key] = [
+                (ts, sev) for ts, sev in self._node_event_window[node_key]
+                if ts >= cutoff
+            ]
+            window = self._node_event_window[node_key]
+
+            low_count    = sum(1 for _, sev in window if sev == AlertSeverity.LOW)
+            medium_count = sum(1 for _, sev in window if sev == AlertSeverity.MEDIUM)
+
+            # Determine escalation candidate for this node
+            if low_count >= 5 or medium_count >= 3:
+                candidate = AlertSeverity.HIGH
+            elif low_count >= 3:
+                candidate = AlertSeverity.MEDIUM
+            else:
+                candidate = base_severity
+
+            if candidate.value > escalated.value:
+                logger.info(
+                    f"[TEMP-ESC] {node_key}: low_flags={low_count} "
+                    f"med_flags={medium_count} within "
+                    f"{cfg.TEMPORAL_WINDOW_SECONDS}s → "
+                    f"{base_severity.name} → {candidate.name}"
+                )
+                escalated = candidate
+
+        # Accumulate CURRENT event (using base_severity, pre-escalation)
+        # into each node's window AFTER escalation is resolved.
+        for node_key in node_keys:
+            self._node_event_window[node_key].append((now, base_severity))
+            # Reset window after HIGH — resolved incident must not feed future windows
+            if escalated == AlertSeverity.HIGH:
+                self._node_event_window[node_key] = []
+
+        return escalated
 
     def _persist_event(self, event: AnomalyEvent) -> None:
         """Append event JSON to alert log file for dashboard consumption."""

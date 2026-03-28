@@ -1,0 +1,42 @@
+# response_policy.yaml — AURA Operator Response Policy
+# ======================================================
+# Rules are evaluated top-to-bottom. First match wins.
+# Severity values: HIGH, MEDIUM, LOW
+# Asset class values: CRITICAL, STANDARD, ANY (matches all)
+#
+# CRITICAL nodes are defined in config.py CRITICAL_ALLOWLIST:
+#   node_0: Domain Controller (AD)
+#   node_1: Core HR Database
+#   node_2: Payment Gateway
+#   node_3: SCADA / ICS Controller
+#
+# To modify response behaviour: edit the 'action' field pointing
+# to the desired script. Do not change severity/asset_class fields
+# unless you understand the cascade consequences.
+
+rules:
+  # HIGH severity on CRITICAL infrastructure:
+  # NEVER isolate — DC/SCADA/DB offline is worse than the attack.
+  # Throttle bandwidth + page analyst immediately.
+  - severity: HIGH
+    asset_class: CRITICAL
+    action: scripts/throttle.sh
+
+  # HIGH severity on standard workstations:
+  # Requires HITL approval. If approved → isolate.
+  # If HITL rejects → policy_engine auto-degrades to throttle.sh.
+  - severity: HIGH
+    asset_class: STANDARD
+    action: scripts/isolate.sh
+
+  # MEDIUM severity on any node:
+  # Autonomous throttle. HITL notification sent (inform only, no gate).
+  - severity: MEDIUM
+    asset_class: ANY
+    action: scripts/throttle.sh
+
+  # LOW severity on any node:
+  # Passive logging only. No network action.
+  - severity: LOW
+    asset_class: ANY
+    action: scripts/log_only.sh
