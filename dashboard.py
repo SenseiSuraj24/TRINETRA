@@ -455,7 +455,8 @@ def run_federation():
         rnd     = r.get("round", "?")
         version = r.get("model_version", "N/A")
         h       = r.get("model_hash", "N/A")
-        kept    = r.get("krum_selected", "?")
+        _trusted = r.get("fltrust_trusted_indices", [])
+        kept     = len(_trusted)
 
         # Keep the latest round's per-client status for the dashboard table
         if "client_statuses" in r:
@@ -466,7 +467,7 @@ def run_federation():
             f"[CLIENT hospital_1] Attack pattern learned. Sending weights…",
             f"[CLIENT bank_2]     Local training complete. Sending weights…",
             f"[CLIENT uni_3]      Local training complete. Sending weights…",
-            f"[SERVER] Krum filtering: {kept}/3 updates accepted.",
+            f"[SERVER] FLTrust: {kept}/3 client updates trusted (cosine vs server root).",
             f"[SERVER] Global Model {version} aggregated.",
             f"[BLOCKCHAIN] Hash recorded: {h[:20]}…",
             f"[CLIENT hospital_1] Verifying hash on chain… ✓ Match. Model deployed.",

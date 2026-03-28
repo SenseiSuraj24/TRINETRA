@@ -549,13 +549,15 @@ class KrumFedAURA(FedAvg):
         self._save_model(aggregated, model_version_tag)
 
         return ndarrays_to_parameters(aggregated), {
-            "model_version":         model_version_tag,
-            "model_hash":            model_hash,
-            "krum_selected":         len(selected_indices),      # kept for dashboard compat
-            "krum_selected_indices": selected_indices,           # kept for dashboard compat
-            "krum_dropped":          len(flagged_indices),       # kept for dashboard compat
-            "trust_scores":          [round(t, 4) for t in trust_scores],
-            "fltrust_flagged":       flagged_indices,
+            "model_version":           model_version_tag,
+            "model_hash":              model_hash,
+            "krum_selected":           len(selected_indices),      # legacy dashboard compat
+            "krum_selected_indices":   selected_indices,
+            "krum_dropped":            len(flagged_indices),
+            "trust_scores":            [round(t, 4) for t in trust_scores],
+            "fltrust_flagged":         flagged_indices,
+            "fltrust_trusted_indices": selected_indices,
+            "fltrust_flagged_indices": flagged_indices,
         }
 
     def _log_hash_local(self, version: str, model_hash: str, rnd: int) -> None:
@@ -722,8 +724,8 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
         )
         # Build per-client status for dashboard display
         # "Byzantine" = whoever Krum DROPPED (mathematical outlier detection)
-        selected_idx = metrics.get('krum_selected_indices', [])
-        dropped_idx  = [i for i in range(len(clients)) if i not in selected_idx]
+        selected_idx = metrics.get("fltrust_trusted_indices", [])
+        dropped_idx  = list(metrics.get("fltrust_flagged_indices", []))
         client_statuses = []
         for i, client in enumerate(clients):
             is_selected  = (selected_idx and i in selected_idx)
@@ -747,7 +749,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
             server_hash   = metrics.get('model_hash')
             print(f"\n  [SERVER] Global Model {model_version} aggregated.")
             print(f"  [SERVER] SHA-256 minted on blockchain: {server_hash[:20]}...")
-            print(f"  [SERVER] Krum kept {metrics.get('krum_selected')} / "
+            print(f"  [SERVER] FLTrust trusted {len(selected_idx)} / "
                   f"{len(clients)} clients.")
             print()
 
@@ -844,3 +846,4 @@ if __name__ == "__main__":
             strategy       = strategy,
         )
 
+FLTrustServerAURA = KrumFedAURA

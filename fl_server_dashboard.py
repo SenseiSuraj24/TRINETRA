@@ -189,7 +189,7 @@ def _init():
         "current_round":    0,
         "total_rounds":     cfg.FL_NUM_ROUNDS,
         "fl_log":           [],
-        "krum_scores_hist": [],  # list of dicts per round
+        "fltrust_scores_hist": [],  # list of dicts per round (trust_scores from server)
         "global_hash":      None,
         "global_version":   None,
         "verify_results":   {},   # org_id → True/False
@@ -228,7 +228,6 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     from aura.fl_client import create_mock_clients
     from aura.models import AURAModelBundle as MB
     from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, FitIns
-    import numpy as np
 
     # ── Determine active orgs from shared readiness file ────────────────────────
     readiness = _read_readiness()
@@ -258,7 +257,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     st.session_state["hash_ledger"]   = []
     st.session_state["hash_local"]    = []
     st.session_state["fl_log"]        = []
-    st.session_state["krum_scores_hist"] = []
+    st.session_state["fltrust_scores_hist"] = []
     st.session_state["verify_results"] = {}
     st.session_state["current_round"] = 0
 
@@ -348,27 +347,17 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         time.sleep(0.35)
         _set_pipe(0, "done")
 
-        # ── STEP 1: Krum Filter ───────────────────────────────────────────
+        # ── STEP 1: FLTrust (server-side trust scores in aggregate_fit) ────
         _set_pipe(1, "active"); _render_pipe(pipe_ph)
-        _log(f"  [SERVER] Running Krum filter on {len(clients)} updates …")
+        _log(f"  [SERVER] Running FLTrust aggregation on {len(clients)} updates …")
 
-        client_updates = [parameters_to_ndarrays(r.parameters) for _, r in fit_results]
-
-        # Compute Krum scores locally for display
-        flat = [np.concatenate([p.flatten() for p in u]) for u in client_updates]
-        n_cl  = len(flat)
-        k_val = max(1, n_cl - cfg.KRUM_NUM_TO_SELECT - 2)
-        scores = []
-        for i in range(n_cl):
-            dists = sorted([float(np.sum((flat[i] - flat[j])**2))
-                            for j in range(n_cl) if j != i])
-            scores.append(sum(dists[:k_val]))
+        n_cl = len(clients)
 
         # ── STEP 2: Aggregate (+ blockchain mint on final round) ──────────
         _set_pipe(1, "done")
         _set_pipe(2, "active"); _render_pipe(pipe_ph)
 
-        # Route through strategy.aggregate_fit — this handles Krum, hash,
+        # Route through strategy.aggregate_fit — FLTrust, hash,
         # blockchain mint (bc_module) and registry write all in one call
         new_params, metrics = strategy.aggregate_fit(
             server_round = rnd,
@@ -376,17 +365,18 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
             failures     = [],
         )
 
-        selected_indices = metrics.get("krum_selected_indices", [])
-        dropped_indices  = [i for i in range(n_cl) if i not in selected_indices]
+        selected_indices = metrics.get("fltrust_trusted_indices", [])
+        dropped_indices  = list(metrics.get("fltrust_flagged_indices", []))
+        trust_scores_round = metrics.get("trust_scores", [])
 
-        st.session_state["krum_scores_hist"].append({
-            "round":    rnd,
-            "scores":   [round(s, 2) for s in scores],
-            "selected": selected_indices,
-            "dropped":  dropped_indices,
+        st.session_state["fltrust_scores_hist"].append({
+            "round":         rnd,
+            "trust_scores":  [round(s, 4) for s in trust_scores_round],
+            "selected":      selected_indices,
+            "dropped":       dropped_indices,
         })
 
-        # Set byzantine_org from whoever Krum DROPPED (outlier = suspicious node)
+        # Set byzantine_org from whoever FLTrust flagged (low cosine trust)
         if dropped_indices:
             krum_byz_org = active_orgs[dropped_indices[0]]
             st.session_state["byzantine_org"] = krum_byz_org
@@ -402,7 +392,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         if krum_accurate and krum_byz_org and krum_byz_org not in quarantined:
             _write_readiness_server(krum_byz_org, under_attack=True)
             _log(f"  [SERVER-AI] \u26a1 Auto-quarantined {krum_byz_org.upper()} "
-                 f"\u2014 Krum confirmed Byzantine update. "
+                 f"\u2014 FLTrust flagged low-trust (Byzantine) update. "
                  f"Org blocked from next FL run until issue resolved.")
 
         for i, org in enumerate(_ORGS):
@@ -427,11 +417,11 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
         drop_labels = [active_orgs[i].capitalize() for i in dropped_indices]
         if krum_byz_org:
             accuracy_tag = " ✓ CORRECT — real attacker caught" if krum_accurate else " ⚠ MISSED — dropped honest node"
-            byz_note = f" ⚡ Krum flagged {krum_byz_org.upper()}{accuracy_tag}"
+            byz_note = f" ⚡ FLTrust flagged {krum_byz_org.upper()}{accuracy_tag}"
         else:
             byz_note = " ✓ no outlier detected"
-        _log(f"  [KRUM] Selected: {sel_labels}  |  Dropped: {drop_labels}{byz_note}")
-        _log(f"  [KRUM] Scores → {['%.1f' % s for s in scores]}")
+        _log(f"  [FLTRUST] Trusted: {sel_labels}  |  Flagged: {drop_labels}{byz_note}")
+        _log(f"  [FLTRUST] Trust scores → {['%.3f' % s for s in trust_scores_round]}")
 
         model_version = metrics.get("model_version", f"v{rnd}.{rnd}")
         model_hash    = metrics.get("model_hash", "")
@@ -494,13 +484,13 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         # ── Persist round result ──────────────────────────────────────────
         st.session_state["round_results"].append({
-            "round":          rnd,
-            "model_version":  model_version,
-            "model_hash":     model_hash,
-            "krum_selected":  len(selected_indices),
-            "krum_dropped":   len(dropped_indices),
-            "krum_scores":    [round(s, 2) for s in scores],
-            "is_final":       is_final,
+            "round":                   rnd,
+            "model_version":           model_version,
+            "model_hash":              model_hash,
+            "fltrust_trusted_indices": selected_indices,
+            "fltrust_flagged_indices": dropped_indices,
+            "trust_scores":            trust_scores_round,
+            "is_final":                is_final,
         })
 
         _render_metrics(metrics_ph)
@@ -647,8 +637,10 @@ def _render_metrics(ph):
     last = rr[-1]
     c1, c2, c3, c4 = ph.columns(4)
     c1.metric("Rounds Done",  f"{len(rr)} / {st.session_state['total_rounds']}")
-    c2.metric("Krum Selected", f"{last.get('krum_selected','?')} / 3")
-    c3.metric("Krum Dropped",  str(last.get("krum_dropped", 0)))
+    _nt = len(last.get("fltrust_trusted_indices", []))
+    _nf = len(last.get("fltrust_flagged_indices", []))
+    c2.metric("FLTrust trusted", f"{_nt} / 3")
+    c3.metric("FLTrust flagged", str(_nf))
     status = "✅ Done" if st.session_state["fl_done"] else "🔄 Running"
     c4.metric("Status", status)
 
@@ -665,7 +657,7 @@ def _render_round_hist(ph):
         f"<th>Version</th>"
         f"<th>✓ Kept</th>"
         f"<th>✗ Dropped</th>"
-        f"<th>Krum Scores</th>"
+        f"<th>Trust scores</th>"
         f"<th>Hash (truncated)</th>"
         f"<th>On-Chain</th>"
         f"</tr>"
@@ -675,13 +667,13 @@ def _render_round_hist(ph):
         chain_mark = (f"<span style='color:{THEME['green']}'>⛓ MINTED</span>"
                       if r["is_final"]
                       else f"<span style='color:{THEME['dim']}'>— local</span>")
-        scores_str = "  ".join([f"{s:.1f}" for s in r.get("krum_scores", [])])
+        scores_str = "  ".join([f"{s:.3f}" for s in r.get("trust_scores", [])])
         rows += (
             f"<tr style='border-bottom:1px solid {br}; font-size:0.77em'>"
             f"<td style='padding:3px 8px; color:{THEME['cyan']}'>{r['round']}</td>"
             f"<td style='color:{THEME['text']}'>{r['model_version']}</td>"
-            f"<td style='color:{THEME['green']}'>{r['krum_selected']}</td>"
-            f"<td style='color:{THEME['red']}'>{r['krum_dropped']}</td>"
+            f"<td style='color:{THEME['green']}'>{len(r.get('fltrust_trusted_indices', []))}</td>"
+            f"<td style='color:{THEME['red']}'>{len(r.get('fltrust_flagged_indices', []))}</td>"
             f"<td style='color:{THEME['dim']}; font-family:monospace'>{scores_str}</td>"
             f"<td style='color:{THEME['dim']}; font-family:monospace'>{r['model_hash'][:22]}…</td>"
             f"<td>{chain_mark}</td>"
