@@ -560,4 +560,40 @@ The following improvements are acknowledged as out-of-scope for the hackathon bu
 | 2026-03-28 | Antigravity (AI) | **Upgrade 1** — Added `policy_engine.py`, `response_policy.yaml`, `scripts/{isolate,throttle,log_only}.sh`. Replaced hardcoded `tc`/`iptables` calls in `response_engine.py` with `policy_engine.execute_response()`. HITL gate enforced: isolation requires `y`; any other input auto-degrades to throttle. `pyyaml` added to `requirements.txt`. |
 | 2026-03-28 | Antigravity (AI) | **Severity Engine Upgrade** — `config.py`: added `TEMPORAL_WINDOW_SECONDS=300`, `K_CONSECUTIVE_READINGS=5`. `detector.py`: (1) `EMAThresholdTracker` — added `threshold_2sigma`/`threshold_2_5sigma` properties, trajectory counters `_consecutive_above_2sigma`/`_consecutive_above_2_5sigma` updated in `update()`, exposed in `state_dict()`; (2) `AURAInferenceEngine` — EMA computed before `l1_triggered` (EMA-first order), trajectory-triggered events invoke L2 GNN, `_classify_severity()` accepts `consec_2sigma`/`consec_2_5sigma` and floors severity via trajectory, `_apply_temporal_escalation()` adds per-node sliding window accumulator with LOW×3→MEDIUM, LOW×5 or MED×3→HIGH escalation rules and HIGH-event window reset. |
 | 2026-03-28 | Antigravity (AI) | **Custom Script Injection Panel** — New `api_server.py` (Flask, port 5001): `/api/nodes` returns live node registry; `/api/inject_custom` validates script (blocks `os.system`, `subprocess`, `import os`, `import sys`), logs `CUSTOM_INJECT` event to alert log, writes `pending_inject.json` for dashboard poll. `dashboard.py`: HTML/JS component inserted between attack buttons and Normal Traffic button — `<textarea id=custom-script-input>`, `<select id=custom-target-node>` (baked node list + live fetch from /api/nodes), `<button id=btn-inject-custom>` (amber border, POSTs to /api/inject_custom, inline error/success feedback, 2-second yellow flash on success, no page reload). `flask>=3.0.0` added to `requirements.txt`. |
-| | | |
+| 2026-03-28 | Antigravity (AI) | **Custom Injection Bug Fixes** — Fix 1 (node colour bridge): `dashboard.py` now polls `logs/pending_inject.json` every rerun cycle; on a fresh entry (< 30 s) sets node state to `⚡ Evaluating…` (yellow), builds `AnomalyEvent` from MSE, drives `responder.act()` → Response Actions panel shows tier, appends `CUSTOM_INJECT` alert to Alert History. File consumed with `{}` after read. Fix 2 (AE reconstruction pass): `api_server.py` now generates anomalous NetFlow features (high packet-size variance, chaotic IAT, unusual port entropy), runs them through lazy-loaded `FlowAutoencoder`, calls `explain_ae()` for per-feature attribution, writes `logs/last_explanation.json` with node/mse/top_features/observed/baseline/timestamp, and updates `pending_inject.json` with real MSE. `dashboard.py` polls `last_explanation.json` (mtime check < 30 s) and renders amber-bordered feature table (Feature | Observed | Baseline | Squared Error bar) below the AE panel. |
+| 2026-03-28 | Antigravity (AI) | **Upgrade 6 — FLTrust Aggregation** — `config.py`: added `FLTRUST_ROOT_SAMPLES=200`, `FLTRUST_SERVER_LR=1e-3`, `FLTRUST_MIN_TRUST_SCORE=0.0`. `aura/fl_server.py`: added `_build_root_dataset()` (synthetic benign root data in MinMax-normalised range), `fltrust_aggregate()` (Cao et al. 2020: server one-step gradient → cosine trust scores → ReLU → magnitude-normalised weighted aggregation → returns `(new_arrays, trust_scores, flagged_indices)`). `KrumFedAURA.aggregate_fit()` now calls `fltrust_aggregate()` instead of `krum_select/krum_aggregate`; Krum functions retained as legacy fallback. Added `_write_trust_log()` method — appends per-round trust records to `logs/fltrust_trust_log.jsonl` (pre-wired for Upgrade 3 Byzantine detection). Return dict exposes `trust_scores` and `fltrust_flagged` alongside existing `krum_*` keys for dashboard backward compat. Byzantine client correctly identified with trust=0.0 in simulation tests. |
+
+---
+
+## 17. Session Handoff State (Current)
+
+> **Handoff Document generated at the end of the current session.**
+
+### Files Touched & Created
+1. **`response_policy.yaml` (NEW):** Defines the 3-tier response rules based on severity and asset class.
+2. **`policy_engine.py` (NEW):** Parses `response_policy.yaml` and handles subprocess scaling with a mandatory Human-In-The-Loop (HITL) prompt for isolation actions.
+3. **`scripts/isolate.sh`, `scripts/throttle.sh`, `scripts/log_only.sh` (NEW):** Shell scripts invoked by the policy engine.
+4. **`api_server.py` (NEW):** Standalone Flask server (port 5001) for the custom script injection backend. Validates scripts, writes synchronization logs, and computes AE inference for anomalous NetFlow features.
+5. **`response_engine.py`:** Replaced hardcoded `tc`/`iptables` execution with `policy_engine.execute_response()`.
+6. **`detector.py`:** Upgraded `EMAThresholdTracker` to include trajectory length (`consecutive_above_2sigma`), rearranged `AURAInferenceEngine` to process EMA before L1 trigger, and implemented a sliding-window temporal accumulator for escalating severities (`LOW×3 → MEDIUM`, etc).
+7. **`dashboard.py`:** Inserted HTML/JS injection panel. Added real-time polling loops to consume `logs/pending_inject.json` (triggering response engine and topology color updates) and `logs/last_explanation.json` (rendering AE feature reconstruction table).
+8. **`config.py`:** Centralized extraction for all new features. Added `TEMPORAL_WINDOW_SECONDS`, `K_CONSECUTIVE_READINGS`, `FEATURE_INDEX_MAP`, `MSE_THRESHOLD_HIGH/MEDIUM`, and `ATTACK_CORRUPTION_PROFILES`.
+9. **`requirements.txt`:** Picked up `pyyaml` and `flask>=3.0.0`.
+
+### Key Functions Modified
+- **`detector.EMAThresholdTracker.update`:** Calculates consecutive anomaly trajectories alongside EMA.
+- **`detector.AURAInferenceEngine._classify_severity`:** Modified to accept trajectory bounds and floor severity levels based on persistence (e.g., `MEDIUM` if > 2.0σ for K readings).
+- **`detector.AURAInferenceEngine._apply_temporal_escalation`:** Orchestrates the per-node timeframe window to compound minor alerts into higher severity events.
+- **`api_server._run_inject_inference`:** Now accepts an `attack_type`, dynamically pulls the correct profile from `config.py`, resolves feature indices using `FEATURE_INDEX_MAP`, runs the AE forward pass, calls `explain_ae`, and persists outputs.
+
+### Known Issues & Quirks
+- **Stale JSON State:** The synchronization bridge between the Streamlit dashboard and the Flask API server relies heavily on JSON files (`pending_inject.json`, `last_explanation.json`) acting as shared memory. File locking limits aren't implemented, which may lead to race conditions under extreme simultaneous load.
+- **HITL Prompt Locality:** The HITL `y/n` prompt blocks on Terminal `stdin`. In a distributed or detached nohup environment, the execution will pause indefinitely.
+
+### Next Pending Upgrade (from `AURA_UPGRADES.md`)
+**UPGRADE 2 — Client-Side SHA-256 Hashing + Dashboard**
+- **Objective:** Establish chain-of-custody by having each Federated Learning client hash its local weight tensor prior to transmission to the aggregation server.
+- **Tasks:**
+  - Update local FL training loop (`fl_client.py` equivalent) to compute a SHA-256 `local_hash` of the state dict.
+  - Modify the Ganache Smart Contract (`ModelRegistry.sol`) to accept and store the `local_hash` along with the global hash.
+  - Build `hash_dashboard.html` with vanilla JS polling a new Flask endpoint (`/api/hashes`) to display the live ledger of client commits.

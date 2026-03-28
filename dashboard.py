@@ -33,6 +33,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
@@ -71,6 +72,11 @@ st.set_page_config(
     layout     = "wide",
     initial_sidebar_state = "expanded",
 )
+
+# Auto-refresh every DASHBOARD_REFRESH_INTERVAL_MS milliseconds.
+# This drives the pending_inject.json poll — without it, the node colour
+# can only update when the user manually clicks a button.
+st_autorefresh(interval=cfg.DASHBOARD_REFRESH_INTERVAL_MS, key="aura_autorefresh")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour Theme
@@ -548,6 +554,76 @@ with m6:
 # Main Content: Network Graph + Score Timeline
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 1 — Custom Injection Bridge: pending_inject.json poll
+# Runs every Streamlit rerun cycle.  Consumes the file written by api_server.py,
+# updates node colour to yellow, drives the response engine with the AE MSE, and
+# appends a CUSTOM_INJECT entry to the Alert History.  Clears the file after read.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_pending_path = Path(cfg.LOGS_DIR) / "pending_inject.json"
+if _pending_path.exists():
+    try:
+        _pi = json.loads(_pending_path.read_text())
+        _pi_idx = int(_pi.get("node_index", -1))
+        _pi_mse = float(_pi.get("mse", 0.0))
+        _pi_ts  = float(_pi.get("timestamp", 0))
+        _pi_nid = str(_pi.get("target_node", ""))
+
+        if _pi_idx >= 0 and _pi_ts > 0 and (time.time() - _pi_ts) < 30:
+            # ── Update topology: target node → yellow ──────────────────────
+            st.session_state["node_colors"][_pi_idx] = THEME["yellow"]
+            st.session_state["node_states"][_pi_idx] = "⚡ Evaluating…"
+
+            # ── Determine severity from MSE ────────────────────────────
+            from aura.detector import AnomalyEvent, AlertSeverity
+            _pi_sev = (
+                AlertSeverity.HIGH   if _pi_mse > cfg.MSE_THRESHOLD_HIGH   else
+                AlertSeverity.MEDIUM if _pi_mse > cfg.MSE_THRESHOLD_MEDIUM else
+                AlertSeverity.LOW
+            )
+            _pi_conf = min(1.0, _pi_mse / 0.5)
+
+            # ── Build AnomalyEvent and drive response engine ───────────────
+            _pi_event = AnomalyEvent(
+                timestamp       = _pi_ts,
+                window_id       = f"CUSTOM_INJECT_{_pi_nid}",
+                ae_score        = _pi_mse,
+                ae_threshold    = 0.3,
+                gnn_scores      = [],
+                severity        = _pi_sev,
+                triggered_nodes = [_pi_idx],
+                confidence      = _pi_conf,
+                raw_label_ratio = 0.0,
+                # Explainability fields — populated by last_explanation.json panel
+                # separately (Fix 2).  Provide required defaults here so the
+                # dataclass constructor doesn't raise TypeError silently.
+                top_features    = [],
+                inferred_attack = "Custom Injection",
+                match_score     = 0.0,
+                group_residuals = {},
+            )
+            if st.session_state.get("responder"):
+                _pi_records = st.session_state["responder"].act(_pi_event)
+                for _pr in _pi_records:
+                    st.session_state["incidents"].insert(0, _pr.to_dict())
+                if len(st.session_state["incidents"]) > 20:
+                    st.session_state["incidents"] = st.session_state["incidents"][:20]
+
+            # ── Append to Alert History ─────────────────────────────────
+            _pi_alert = _pi_event.to_dict()
+            _pi_alert["tag"] = "CUSTOM_INJECT"
+            st.session_state["alerts"].insert(0, _pi_alert)
+            if len(st.session_state["alerts"]) > 30:
+                st.session_state["alerts"] = st.session_state["alerts"][:30]
+            st.session_state["total_attacks"] += 1
+
+        # Consume-once: overwrite with empty so next cycle skips it
+        _pending_path.write_text("{}")
+    except Exception:
+        pass
+
 col_graph, col_score = st.columns([1, 1])
 
 with col_graph:
@@ -699,6 +775,83 @@ else:
             f"</div>",
             unsafe_allow_html=True,
         )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 2 — Custom Injection AE Explanation Panel
+# Polls logs/last_explanation.json on every rerun.  Renders only if the file
+# was written within the last 30 seconds (checked via mtime).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_expl_json_path = Path(cfg.LOGS_DIR) / "last_explanation.json"
+_show_inject_expl = False
+_inject_expl_data = {}
+
+if _expl_json_path.exists():
+    try:
+        _age = time.time() - _expl_json_path.stat().st_mtime
+        if _age < 30:
+            _inject_expl_data = json.loads(_expl_json_path.read_text())
+            _show_inject_expl  = bool(_inject_expl_data.get("top_features"))
+    except Exception:
+        pass
+
+if _show_inject_expl:
+    _ied     = _inject_expl_data
+    _ie_node = _ied.get("node", "")
+    _ie_mse  = _ied.get("mse", 0.0)
+    _ie_atk  = _ied.get("inferred_attack", "Unknown")
+    _ie_sc   = _ied.get("match_score", 0.0)
+    _ie_tf   = _ied.get("top_features", [])
+    _ie_ts   = _ied.get("timestamp", "")
+
+    _hdr_color = THEME["orange"]
+    _bg, _br   = THEME["panel"], THEME["border"]
+    _dim, _txt = THEME["dim"], THEME["text"]
+    _amber     = "#f59e0b"
+
+    st.markdown(
+        f"<div style='background:{_bg}; border:1px solid {_amber}; "
+        f"border-radius:8px; padding:0.7rem 1rem; margin-top:0.6rem'>"
+        f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem'>"
+        f"<span style='color:{_amber}; font-weight:bold; font-size:0.9em'>"
+        f"⚡ Custom Injection — AE Reconstruction Analysis</span>"
+        f"<span style='color:{_dim}; font-size:0.75em'>"
+        f"{_ie_node} │ MSE <b style='color:{THEME['red']}'>{_ie_mse:.4f}</b> │ "
+        f"Inferred: <b style='color:{_txt}'>{_ie_atk}</b> │ "
+        f"Match: <b style='color:{_txt}'>{_ie_sc:.0%}</b> │ {_ie_ts}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Feature rows
+    _max_err = max((f["error"] for f in _ie_tf), default=1e-6)
+    _rows_html = ""
+    for _f in _ie_tf:
+        _bar_w  = max(4, int(180 * _f["error"] / max(_max_err, 1e-6)))
+        _bar_col = THEME["red"] if _f["error"] > 0.1 else THEME["orange"]
+        _rows_html += (
+            f"<tr style='border-bottom:1px solid {_br}'>"
+            f"<td style='padding:3px 8px; color:{_dim}; font-size:0.76em; white-space:nowrap'>{_f['name']}</td>"
+            f"<td style='padding:3px 8px; color:{_txt}; font-size:0.76em; text-align:right'>{_f['observed']:.3f}</td>"
+            f"<td style='padding:3px 8px; color:{_dim}; font-size:0.76em; text-align:right'>{_f['baseline']:.3f}</td>"
+            f"<td style='padding:3px 8px'>"
+            f"<div style='display:flex;align-items:center;gap:6px'>"
+            f"<div style='background:{_bar_col};height:10px;width:{_bar_w}px;border-radius:3px;opacity:0.85'></div>"
+            f"<span style='color:{_bar_col};font-size:0.74em;font-weight:bold'>{_f['error']:.4f}</span>"
+            f"</div></td></tr>"
+        )
+
+    st.markdown(
+        f"<table style='width:100%;border-collapse:collapse'>"
+        f"<thead><tr style='color:{_dim};font-size:0.72em;border-bottom:1px solid {_br}'>"
+        f"<th style='text-align:left;padding:2px 8px'>Feature</th>"
+        f"<th style='text-align:right;padding:2px 8px'>Observed</th>"
+        f"<th style='text-align:right;padding:2px 8px'>Baseline</th>"
+        f"<th style='text-align:left;padding:2px 8px'>Squared Error</th>"
+        f"</tr></thead>"
+        f"<tbody>{_rows_html}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Control Panel (3 columns)

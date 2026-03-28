@@ -1,27 +1,35 @@
 """
-aura/fl_server.py — Flower FL Server: Krum Aggregation + Straggler Policy
-==========================================================================
+aura/fl_server.py — Flower FL Server: FLTrust Aggregation + Straggler Policy
+=============================================================================
 
 This server implements two critical security properties:
 
-1. BYZANTINE ROBUSTNESS (Krum Aggregation)
-   -----------------------------------------
-   Standard FedAvg is vulnerable to "model poisoning" — a compromised
-   client can send a manipulated weight update that pushes the global
-   model to misclassify specific attacks.
+1. BYZANTINE ROBUSTNESS (FLTrust Aggregation — Upgrade 6)
+   --------------------------------------------------------
+   Standard FedAvg is vulnerable to model poisoning. Krum guards against
+   it geometrically (distance-based) but has a critical flaw: it rejects
+   clients whose updates are geometrically distant even if they are
+   *honestly* trained on rare or skewed data distributions (e.g., a
+   hospital with rare disease traffic).  This causes false-positive
+   rejections of legitimate but outlier clients.
 
-   Krum (Blanchard et al., 2017) defends against this:
-     - For each client's update, compute the sum of squared Euclidean
-       distances to its k nearest neighbour updates.
-     - Select the m updates with the LOWEST neighbourhood distances.
-     - These are the "most central" updates — mathematical outliers
-       (poisoned clients) have high distances and are dropped.
+   FLTrust (Cao et al., 2020) fixes this:
+     - The server holds a small clean root dataset (FLTRUST_ROOT_SAMPLES
+       synthetic benign samples).
+     - Each round, the server trains one optimisation step on the root
+       dataset to obtain a reference gradient direction.
+     - Each client update is scored by its cosine similarity with the
+       server's gradient direction — ReLU ensures negative similarity
+       (i.e., adversarial reversal) maps to zero trust.
+     - Client updates are re-scaled to the server update's magnitude
+       before weighted aggregation, preventing magnitude-based amplification.
 
-   The aggregated global model is the mean of the m selected updates.
+   Key advantage: a hospital client with unusual-but-legitimate data has
+   a gradient that still *points in the same direction* as improvement on
+   normal traffic. Krum would drop it; FLTrust keeps it with proportional
+   trust.
 
-   Guarantee: Krum is proven resilient to f Byzantine workers as long as
-   n > 2f + 2 (where n = total clients, f = faulty clients).
-   With 3 clients: n=3, f≤0, so 1 poisoned client is tolerated.
+   Krum functions are retained as legacy code in case of rollback.
 
 2. STRAGGLER TIMEOUT POLICY
    --------------------------
@@ -35,9 +43,6 @@ This server implements two critical security properties:
      - If fewer than `min_clients` responses arrive, the round is
        ABANDONED and the previous global model is preserved.
      - A warning is logged for operator review.
-
-   This is configured via Flower's `on_fit_config_fn` and
-   `min_available_clients` parameters + a strategy-level timeout.
 
 3. IMMUTABLE AUDIT LOG
    ----------------------
@@ -56,6 +61,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import flwr as fl
 from flwr.common import (
     FitRes, Parameters, Scalar,
@@ -166,6 +173,153 @@ def krum_aggregate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Root Dataset (server trusted data for FLTrust)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tensor:
+    """
+    Generate a synthetic root dataset of benign-looking NetFlow features.
+
+    In a real deployment this would be a curated hold-out split of verified
+    benign traffic.  In the hackathon demo we generate Gaussian samples in
+    the same normalised range as Monday CSV benign traffic (mean ~0.4, low
+    variance) so the server gradient still points in the right direction.
+
+    Shape: [n_samples, FEATURE_DIM]  on CPU.
+    """
+    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised CICIDS space
+    data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
+    return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLTrust Aggregation (Upgrade 6 — replaces Krum in aggregate_fit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fltrust_aggregate(
+    global_model:    AURAModelBundle,
+    client_updates:  List[List[np.ndarray]],   # per-client list-of-arrays
+    root_data:       torch.Tensor,             # server's trusted benign dataset
+    server_lr:       float = cfg.FLTRUST_SERVER_LR,
+    min_trust:       float = cfg.FLTRUST_MIN_TRUST_SCORE,
+) -> Tuple[List[np.ndarray], List[float], List[int]]:
+    """
+    FLTrust Aggregation (Cao et al., 2020).
+
+    Algorithm
+    ---------
+    1. Compute server reference update:
+         Clone the global model, train one step on root_data (benign),
+         delta_server = new_params − old_params.
+         Flatten to 1-D vector: server_vec.
+
+    2. For each client i:
+         delta_i    = client_params_i − global_params
+         client_vec = flatten(delta_i)
+         trust_i    = ReLU(cosine_similarity(client_vec, server_vec))
+         # Positive = update points same direction as benign improvement
+         # Negative = adversarial reversal → ReLU ⇒ zero trust, flagged.
+
+    3. Normalise client update magnitude to server update magnitude:
+         scale_i = ||server_vec|| / (||client_vec|| + ε)
+         normalised_i = scale_i × delta_i
+
+    4. Weighted aggregation:
+         new_global = global + Σ(trust_i / Σtrust) × normalised_i
+
+    Parameters
+    ----------
+    global_model   : The current global AURAModelBundle.
+    client_updates : Each element is a list of np.ndarray (Flower format).
+    root_data      : [N, F] benign tensor (server's trusted data).
+    server_lr      : LR for the one-step server gradient computation.
+    min_trust      : Trust scores at or below this are flagged Byzantine.
+
+    Returns
+    -------
+    (new_arrays, trust_scores, flagged_indices)
+      new_arrays    : Aggregated model as list[np.ndarray] (same layout as input)
+      trust_scores  : Per-client cosine trust score ∈ [0, 1]
+      flagged_indices: Indices of clients with trust ≤ min_trust (Byzantine suspects)
+    """
+    # ── Step 1: Compute server reference one-step update ───────────────────
+    server_model = AURAModelBundle()
+    # Load current global weights
+    global_param_list = [p.detach().cpu() for p in global_model.parameters()]
+    with torch.no_grad():
+        for p, gp in zip(server_model.parameters(), global_param_list):
+            p.copy_(gp)
+
+    # One gradient step on root data (autoencoder reconstruction loss)
+    optimiser = torch.optim.Adam(server_model.autoencoder.parameters(), lr=server_lr)
+    server_model.autoencoder.train()
+    optimiser.zero_grad()
+    x_hat, _ = server_model.autoencoder(root_data)
+    loss = nn.functional.mse_loss(x_hat, root_data)
+    loss.backward()
+    # Clip to match client training (preserves fairness in magnitude comparison)
+    torch.nn.utils.clip_grad_norm_(server_model.autoencoder.parameters(), max_norm=1.0)
+    optimiser.step()
+    server_model.eval()
+
+    # Server delta (new weights − old weights), flattened
+    server_delta = [
+        (p.detach().cpu() - gp)
+        for p, gp in zip(server_model.parameters(), global_param_list)
+    ]
+    server_vec = torch.cat([d.flatten() for d in server_delta])   # [D]
+    server_norm = server_vec.norm()                                # scalar
+
+    # ── Step 2 & 3: Per-client trust scores + normalised deltas ───────────
+    trust_scores: List[float] = []
+    normalised_deltas: List[List[torch.Tensor]] = []   # per-client list of tensors
+
+    global_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
+
+    for client_arrays in client_updates:
+        # Build per-layer delta (client_params − global_params)
+        client_delta = [
+            torch.tensor(c_arr, dtype=torch.float32) - torch.tensor(g_arr, dtype=torch.float32)
+            for c_arr, g_arr in zip(client_arrays, global_arrays)
+        ]
+        client_vec = torch.cat([d.flatten() for d in client_delta])   # [D]
+        client_norm = client_vec.norm()
+
+        # Cosine similarity with server gradient direction
+        cos_sim = F.cosine_similarity(
+            server_vec.unsqueeze(0), client_vec.unsqueeze(0)
+        ).item()
+        # ReLU: adversarial reversal (negative cos) ⇒ zero trust
+        trust = max(0.0, cos_sim)
+        trust_scores.append(trust)
+
+        # Re-scale client delta to server update magnitude (prevents amplification)
+        scale = float(server_norm) / (float(client_norm) + 1e-8)
+        normalised_deltas.append([d * scale for d in client_delta])
+
+    # ── Step 4: Weighted aggregation ────────────────────────────────────
+    total_trust = sum(trust_scores) + 1e-8
+
+    # Identify Byzantine suspects (zero or near-zero trust)
+    flagged_indices = [
+        i for i, t in enumerate(trust_scores) if t <= min_trust
+    ]
+
+    # Initialise new state as: global_params + weighted sum of normalised deltas
+    new_arrays: List[np.ndarray] = []
+    for layer_idx in range(len(global_arrays)):
+        accumulated = torch.zeros_like(
+            torch.tensor(global_arrays[layer_idx], dtype=torch.float32)
+        )
+        for i, (trust, deltas) in enumerate(zip(trust_scores, normalised_deltas)):
+            accumulated += (trust / total_trust) * deltas[layer_idx]
+        result = torch.tensor(global_arrays[layer_idx], dtype=torch.float32) + accumulated
+        new_arrays.append(result.numpy().astype(np.float32))
+
+    return new_arrays, trust_scores, flagged_indices
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SHA-256 Model Hash
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -190,10 +344,14 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
 class KrumFedAURA(FedAvg):
     """
     Custom Flower aggregation strategy extending FedAvg with:
-      1. Krum-based Byzantine-robust aggregation
+      1. FLTrust Byzantine-robust aggregation (replaces Krum — Upgrade 6)
       2. Straggler timeout + drop policy
       3. Per-round SHA-256 model hash logging
       4. Blockchain audit integration
+
+    Class name is intentionally kept as KrumFedAURA for backward compatibility
+    — all callers (dashboard, run.py, simulation) instantiate this class by
+    name and would require touching multiple files if renamed.
 
     Inheriting from FedAvg reuses all the Flower boilerplate (
     sampling, evaluation scheduling, etc.) while overriding only
@@ -226,6 +384,16 @@ class KrumFedAURA(FedAvg):
         self._model_version    = 0
         self._hash_history: List[dict] = []
 
+        # FLTrust root dataset — generated once, reused every round.
+        # This is the server's small trusted benign baseline.
+        self._root_data: torch.Tensor = _build_root_dataset()
+        # Global model reference — updated after each successful aggregation.
+        # FLTrust needs the current global state to compute per-client deltas.
+        self._global_model: AURAModelBundle = AURAModelBundle()
+
+        # Per-round trust score history (for dashboard + Upgrade 3 detection log)
+        self._trust_history: List[dict] = []
+
         # Clear the trusted registry at the start of each FL session so that
         # only the current session's final hash is present (1 hash per run).
         registry_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
@@ -234,9 +402,10 @@ class KrumFedAURA(FedAvg):
         logger.info("[REGISTRY] Cleared — fresh FL session starting.")
 
         logger.info(
-            f"KrumFedAURA strategy ready  |  "
+            f"KrumFedAURA (FLTrust) strategy ready  |  "
             f"rounds={num_rounds}  timeout={round_timeout_sec}s  "
-            f"krum_select={cfg.KRUM_NUM_TO_SELECT}"
+            f"root_samples={cfg.FLTRUST_ROOT_SAMPLES}  "
+            f"server_lr={cfg.FLTRUST_SERVER_LR}"
         )
 
     def aggregate_fit(
@@ -291,15 +460,47 @@ class KrumFedAURA(FedAvg):
             logger.info(f"{round_tag} Received update  |  "
                         f"num_examples={fit_res.num_examples}  loss={client_loss}")
 
-        # ── Krum Filtering ───────────────────────────────────────────────────
-        print(f"\n{round_tag} Running Krum filtering on {n_received} updates …")
-        selected_indices = krum_select(client_updates, cfg.KRUM_NUM_TO_SELECT)
-        selected_updates = [client_updates[i] for i in selected_indices]
-
-        # ── Aggregate selected updates ────────────────────────────────────────
-        aggregated = krum_aggregate(selected_updates)
+        # ── FLTrust Aggregation ──────────────────────────────────────────────────────────────
+        print(f"\n{round_tag} Running FLTrust aggregation on {n_received} updates …")
+        aggregated, trust_scores, flagged_indices = fltrust_aggregate(
+            global_model   = self._global_model,
+            client_updates = client_updates,
+            root_data      = self._root_data,
+            server_lr      = cfg.FLTRUST_SERVER_LR,
+            min_trust      = cfg.FLTRUST_MIN_TRUST_SCORE,
+        )
         self._model_version += 1
         model_version_tag = f"v{self._model_version}.{server_round}"
+
+        # ── Log per-client trust scores ──────────────────────────────────────────
+        for idx, (trust, (cp, fr)) in enumerate(zip(trust_scores, results)):
+            status = "BYZANTINE SUSPECT" if idx in flagged_indices else "trusted"
+            print(
+                f"{round_tag} [FLTrust] Client {idx} — "
+                f"trust={trust:.4f}  [{status}]  "
+                f"loss={fr.metrics.get('train_loss', 'N/A')}"
+            )
+            if idx in flagged_indices:
+                logger.warning(
+                    f"{round_tag} [FLTrust] Client {idx} flagged — "
+                    f"trust score {trust:.4f} ≤ threshold {cfg.FLTRUST_MIN_TRUST_SCORE}. "
+                    f"Client's gradient direction opposes benign improvement."
+                )
+
+        # Persist trust scores for Upgrade 3 detection log
+        trust_record = {
+            "round":          server_round,
+            "trust_scores":   [round(t, 4) for t in trust_scores],
+            "flagged_indices": flagged_indices,
+            "timestamp":      time.time(),
+        }
+        self._trust_history.append(trust_record)
+        self._write_trust_log(trust_record)
+
+        # Update server's global model reference for next round
+        with torch.no_grad():
+            for p, arr in zip(self._global_model.parameters(), aggregated):
+                p.copy_(torch.tensor(arr))
 
         # ── SHA-256 Hash (computed every round — clients verify weights) ──────
         model_hash = hash_model_weights(aggregated)
@@ -334,6 +535,8 @@ class KrumFedAURA(FedAvg):
 
         # Expose which indices were selected so client_statuses can use it
         # Record in history (for dashboard display)
+        # NOTE: selected_indices is now all clients with trust > 0
+        selected_indices = [i for i, t in enumerate(trust_scores) if t > cfg.FLTRUST_MIN_TRUST_SCORE]
         self._hash_history.append({
             "round":   server_round,
             "version": model_version_tag,
@@ -346,11 +549,13 @@ class KrumFedAURA(FedAvg):
         self._save_model(aggregated, model_version_tag)
 
         return ndarrays_to_parameters(aggregated), {
-            "model_version":        model_version_tag,
-            "model_hash":           model_hash,
-            "krum_selected":        len(selected_indices),
-            "krum_selected_indices": selected_indices,
-            "krum_dropped":         n_received - len(selected_indices),
+            "model_version":         model_version_tag,
+            "model_hash":            model_hash,
+            "krum_selected":         len(selected_indices),      # kept for dashboard compat
+            "krum_selected_indices": selected_indices,           # kept for dashboard compat
+            "krum_dropped":          len(flagged_indices),       # kept for dashboard compat
+            "trust_scores":          [round(t, 4) for t in trust_scores],
+            "fltrust_flagged":       flagged_indices,
         }
 
     def _log_hash_local(self, version: str, model_hash: str, rnd: int) -> None:
@@ -381,6 +586,23 @@ class KrumFedAURA(FedAvg):
         registry[version] = model_hash
         registry_path.write_text(json.dumps(registry, indent=2))
         logger.info(f"[REGISTRY] {version} written to trusted registry.")
+
+    def _write_trust_log(self, record: dict) -> None:
+        """
+        Append per-round trust scoring record to logs/fltrust_trust_log.jsonl.
+        Consumed by Upgrade 3 (Byzantine detection dashboard table).
+        """
+        try:
+            log_path = Path(cfg.LOGS_DIR) / "fltrust_trust_log.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+            logger.info(
+                f"[FLTRUST] Round {record['round']} trust log written — "
+                f"flagged={record['flagged_indices']}"
+            )
+        except Exception as e:
+            logger.warning(f"[FLTRUST] Trust log write failed: {e}")
 
     def _save_model(self, arrays: List[np.ndarray], version_tag: str) -> None:
         """Save the aggregated global model weights to disk."""
