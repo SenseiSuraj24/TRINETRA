@@ -739,7 +739,230 @@ with ctrl_atk:
                 )
                 st.rerun()
 
+    # ── Custom Script Injection Block ─────────────────────────────────────────
+    # Rendered as a self-contained HTML/JS component via st.components.v1.html().
+    # Communicates with api_server.py (Flask) running on port 5001.
+    # No page reload on submit — success/error feedback is fully inline.
+    import streamlit.components.v1 as _components
+
+    # Bake node list into JS at render time so the UI works even if the API
+    # server hasn't started yet (graceful degradation).
+    _baked_nodes = json.dumps([
+        {
+            "id":       f"node_{i}",
+            "label":    cfg.CRITICAL_ALLOWLIST.get(f"node_{i}", f"Host-{i:02d}"),
+            "critical": f"node_{i}" in cfg.CRITICAL_ALLOWLIST,
+        }
+        for i in range(cfg.NUM_SYNTHETIC_NODES)
+    ])
+
+    _panel_bg     = THEME["panel"]
+    _panel_border = THEME["border"]
+    _text_color   = THEME["text"]
+    _dim_color    = THEME["dim"]
+    _amber        = "#f59e0b"
+    _red          = THEME["red"]
+    _green        = THEME["green"]
+    _yellow       = THEME["yellow"]
+
+    _inject_html = f"""
+    <style>
+      * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+      body {{ background: transparent; font-family: 'Segoe UI', sans-serif; }}
+
+      #custom-inject-panel {{
+        background: {_panel_bg};
+        border: 1px solid {_panel_border};
+        border-radius: 8px;
+        padding: 0.7rem 0.8rem;
+        margin-top: 0.4rem;
+      }}
+
+      #custom-inject-panel label {{
+        display: block;
+        font-size: 0.72em;
+        color: {_dim_color};
+        margin-bottom: 4px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }}
+
+      #custom-script-input {{
+        width: 100%;
+        rows: 6;
+        background: #070b14;
+        border: 1px solid {_panel_border};
+        border-radius: 5px;
+        color: {_text_color};
+        font-family: 'Courier New', monospace;
+        font-size: 0.78em;
+        padding: 0.5rem;
+        resize: vertical;
+        min-height: 90px;
+        outline: none;
+        transition: border-color 0.2s;
+      }}
+      #custom-script-input:focus {{ border-color: {_amber}; }}
+
+      #custom-target-node {{
+        width: 100%;
+        background: #070b14;
+        border: 1px solid {_panel_border};
+        border-radius: 5px;
+        color: {_text_color};
+        font-size: 0.78em;
+        padding: 0.4rem 0.5rem;
+        margin-top: 0.4rem;
+        outline: none;
+        appearance: none;
+        cursor: pointer;
+        transition: border-color 0.2s;
+      }}
+      #custom-target-node:focus {{ border-color: {_amber}; }}
+
+      #btn-inject-custom {{
+        width: 100%;
+        margin-top: 0.5rem;
+        padding: 0.42rem 0;
+        background: transparent;
+        border: 1px solid {_amber};
+        border-radius: 5px;
+        color: {_amber};
+        font-size: 0.82em;
+        font-weight: 600;
+        cursor: pointer;
+        letter-spacing: 0.03em;
+        transition: background 0.2s, color 0.2s;
+      }}
+      #btn-inject-custom:hover  {{ background: {_amber}22; }}
+      #btn-inject-custom:active {{ background: {_amber}44; }}
+      #btn-inject-custom:disabled {{
+        opacity: 0.5; cursor: not-allowed; border-color: {_dim_color};
+      }}
+
+      #inject-status {{
+        margin-top: 0.4rem;
+        font-size: 0.75em;
+        min-height: 1.2em;
+      }}
+    </style>
+
+    <div id="custom-inject-panel">
+      <label>⚡ Custom Script Injection</label>
+
+      <textarea
+        id="custom-script-input"
+        rows="6"
+        placeholder="# Write your attack script here"
+      ></textarea>
+
+      <select id="custom-target-node">
+        <option value="">Select target node</option>
+      </select>
+
+      <button id="btn-inject-custom">⚡ Inject Custom Script</button>
+
+      <div id="inject-status"></div>
+    </div>
+
+    <script>
+    (function() {{
+      const BAKED_NODES = {_baked_nodes};
+      const API_BASE    = "http://localhost:5001";
+
+      // ── Populate dropdown ────────────────────────────────────────────────
+      function populateSelect(nodes) {{
+        const sel = document.getElementById("custom-target-node");
+        // Clear existing options beyond the default
+        while (sel.options.length > 1) sel.remove(1);
+        nodes.forEach(function(n) {{
+          const opt       = document.createElement("option");
+          opt.value       = n.id;
+          const crit      = n.critical ? " 🔑" : "";
+          opt.textContent = n.id + " — " + n.label + crit;
+          sel.appendChild(opt);
+        }});
+      }}
+
+      // Populate from baked-in list immediately (no API dependency)
+      populateSelect(BAKED_NODES);
+
+      // Then try to refresh from live /api/nodes
+      fetch(API_BASE + "/api/nodes")
+        .then(function(r) {{ return r.json(); }})
+        .then(function(nodes) {{ if (nodes && nodes.length) populateSelect(nodes); }})
+        .catch(function() {{ /* API not running — baked list already shown */ }});
+
+      // ── Inject button ────────────────────────────────────────────────────
+      document.getElementById("btn-inject-custom").addEventListener("click", async function() {{
+        const btn       = document.getElementById("btn-inject-custom");
+        const statusEl  = document.getElementById("inject-status");
+        const script    = document.getElementById("custom-script-input").value;
+        const target    = document.getElementById("custom-target-node").value;
+
+        // Client-side validation
+        if (!target) {{
+          statusEl.innerHTML = '<span style="color:{_red}">⚠ Please select a target node.</span>';
+          return;
+        }}
+        if (!script.trim()) {{
+          statusEl.innerHTML = '<span style="color:{_red}">⚠ Script cannot be empty.</span>';
+          return;
+        }}
+
+        btn.disabled = true;
+        statusEl.innerHTML = '<span style="color:{_dim_color}">Submitting…</span>';
+
+        try {{
+          const resp = await fetch(API_BASE + "/api/inject_custom", {{
+            method:  "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body:    JSON.stringify({{ script: script, target_node: target }}),
+          }});
+
+          const data = await resp.json();
+
+          if (!resp.ok) {{
+            // Error — display inline, no reload
+            statusEl.innerHTML =
+              '<span style="color:{_red}">✗ ' +
+              (data.error || "Injection failed.") +
+              "</span>";
+          }} else {{
+            // Success — flash target node indicator yellow for 2 s
+            const sel       = document.getElementById("custom-target-node");
+            const nodeLabel = sel.options[sel.selectedIndex].text;
+
+            statusEl.innerHTML =
+              '<span style="color:{_amber}; font-weight:600">' +
+              "⚡ Script injected → " + nodeLabel +
+              ' <span style="font-weight:normal; color:{_yellow}">' +
+              "(Evaluating…)</span></span>";
+
+            // Flash the select border yellow for 2 s to indicate Evaluating state
+            sel.style.borderColor = "{_yellow}";
+            sel.style.boxShadow   = "0 0 6px {_yellow}66";
+            setTimeout(function() {{
+              sel.style.borderColor = "";
+              sel.style.boxShadow   = "";
+              statusEl.innerHTML    = "";
+            }}, 2000);
+          }}
+        }} catch (e) {{
+          statusEl.innerHTML =
+            '<span style="color:{_red}">✗ API server unreachable.' +
+            ' Start <code>python api_server.py</code> on port 5001.</span>';
+        }} finally {{
+          btn.disabled = false;
+        }}
+      }});
+    }})();
+    </script>
+    """
+    _components.html(_inject_html, height=250, scrolling=False)
+
     if st.button("🟢 Generate Normal Traffic", use_container_width=True):
+
         st.session_state["attack_active"] = False
         st.session_state["system_status"] = "ACTIVE"
 
