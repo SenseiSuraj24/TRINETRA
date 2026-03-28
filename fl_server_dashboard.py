@@ -4,9 +4,9 @@ fl_server_dashboard.py — AURA Federated Learning Server Dashboard
 
 Dedicated server-side console showing:
   • All three org clients (Hospital / Bank / University)
-  • Step-by-step FL pipeline animation (collect → Krum → aggregate → mint → broadcast)
+  • Step-by-step FL pipeline animation (collect → FLTrust → aggregate → mint → broadcast)
   • Blockchain hash minting live feed
-  • Per-round history table with Krum scores
+  • Per-round history table with FLTrust trust scores
   • Client hash verification outcome
 """
 
@@ -35,7 +35,7 @@ def _read_readiness() -> dict:
 def _write_readiness_server(org_key: str, under_attack: bool) -> None:
     """
     Server-side write to fl_readiness.json.
-    Called automatically when Krum detects a Byzantine client so the org
+    Called automatically when FLTrust flags a Byzantine client so the org
     dashboard reflects quarantine status without any manual button press.
     """
     try:
@@ -169,7 +169,7 @@ _ORG_ID_TO_KEY = {
 
 _PIPE_STEPS = [
     ("📥", "Collect\nWeights"),
-    ("🔬", "Krum\nFilter"),
+    ("🔬", "FLTrust\nFilter"),
     ("🧮", "Aggregate"),
     ("⛓",  "Mint\nHash"),
     ("📡", "Broadcast\n+ Verify"),
@@ -193,7 +193,7 @@ def _init():
         "global_hash":      None,
         "global_version":   None,
         "verify_results":   {},   # org_id → True/False
-        "byzantine_org":    None,  # org key Krum dropped (detected outlier)
+        "byzantine_org":    None,  # org key FLTrust flagged (low trust)
         "attack_idx":       None,  # index of client with injected attack data
         "active_orgs":      [],    # orgs that participated in the last FL run
         "quarantined_orgs": [],    # orgs blocked due to active attack
@@ -235,7 +235,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     # Exclude orgs that are: (a) not ready, OR (b) currently under active attack.
     # Under-attack orgs are quarantined — they must NOT contribute weights to FL
     # because their data is compromised. They are blocked before FL starts, not
-    # Krum-dropped after (Krum is a last-resort defence; quarantine is proactive).
+    # FLTrust-flagged after aggregation (FLTrust is a last-resort signal; quarantine is proactive).
     quarantined = [k for k in all_org_keys
                    if readiness.get(k, {}).get("under_attack", False)]
     active_orgs = [k for k in all_org_keys
@@ -284,7 +284,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
     # All orgs participate honestly by default — no attack injected.
     # Attack injection only happens when triggered externally (future feature).
-    # Krum will still run and may drop the statistical outlier due to random
+    # FLTrust still runs and may flag a low-trust client due to random
     # weight init variance, but honest orgs are never auto-quarantined.
     attack_org        = None
     attack_client_arg = -1   # -1 = all honest
@@ -378,20 +378,20 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         # Set byzantine_org from whoever FLTrust flagged (low cosine trust)
         if dropped_indices:
-            krum_byz_org = active_orgs[dropped_indices[0]]
-            st.session_state["byzantine_org"] = krum_byz_org
+            fltrust_byz_org = active_orgs[dropped_indices[0]]
+            st.session_state["byzantine_org"] = fltrust_byz_org
         else:
-            krum_byz_org = None
+            fltrust_byz_org = None
 
         # ── Server AI Auto-Quarantine ─────────────────────────────────────
-        # Only quarantine when attack data was ACTUALLY injected AND Krum
-        # caught exactly that client. Never quarantine on honest-noise drops.
+        # Only quarantine when attack data was ACTUALLY injected AND FLTrust
+        # flagged exactly that client. Never quarantine on honest-noise drops.
         _atk_idx     = st.session_state.get("attack_idx")
         _atk_injected = (_atk_idx is not None and isinstance(_atk_idx, int) and _atk_idx >= 0)
-        krum_accurate = _atk_injected and (_atk_idx in dropped_indices)
-        if krum_accurate and krum_byz_org and krum_byz_org not in quarantined:
-            _write_readiness_server(krum_byz_org, under_attack=True)
-            _log(f"  [SERVER-AI] \u26a1 Auto-quarantined {krum_byz_org.upper()} "
+        fltrust_accurate = _atk_injected and (_atk_idx in dropped_indices)
+        if fltrust_accurate and fltrust_byz_org and fltrust_byz_org not in quarantined:
+            _write_readiness_server(fltrust_byz_org, under_attack=True)
+            _log(f"  [SERVER-AI] \u26a1 Auto-quarantined {fltrust_byz_org.upper()} "
                  f"\u2014 FLTrust flagged low-trust (Byzantine) update. "
                  f"Org blocked from next FL run until issue resolved.")
 
@@ -415,9 +415,9 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
         sel_labels  = [active_orgs[i].capitalize() for i in selected_indices]
         drop_labels = [active_orgs[i].capitalize() for i in dropped_indices]
-        if krum_byz_org:
-            accuracy_tag = " ✓ CORRECT — real attacker caught" if krum_accurate else " ⚠ MISSED — dropped honest node"
-            byz_note = f" ⚡ FLTrust flagged {krum_byz_org.upper()}{accuracy_tag}"
+        if fltrust_byz_org:
+            accuracy_tag = " ✓ CORRECT — real attacker caught" if fltrust_accurate else " ⚠ MISSED — flagged honest node"
+            byz_note = f" ⚡ FLTrust flagged {fltrust_byz_org.upper()}{accuracy_tag}"
         else:
             byz_note = " ✓ no outlier detected"
         _log(f"  [FLTRUST] Trusted: {sel_labels}  |  Flagged: {drop_labels}{byz_note}")
@@ -552,7 +552,7 @@ def _render_clients(card_phs):
         "quarantined": ("\U0001f6ab Quarantined",       THEME["red"],    "dropped"),
     }
     # Resolve Byzantine and quarantine dynamically from session state
-    _krum_byz    = st.session_state.get("byzantine_org")
+    _fltrust_byz = st.session_state.get("byzantine_org")
     _quarantined = st.session_state.get("quarantined_orgs", [])
     for i, org in enumerate(_ORGS):
         c       = cards[org["id"]]
@@ -562,8 +562,8 @@ def _render_clients(card_phs):
         if org_key in _quarantined:
             role_label = "🚨 Under Attack — Blocked"
             role_color = THEME["red"]
-        elif _krum_byz and _krum_byz == org_key:
-            role_label = "⚠ Krum-flagged"
+        elif _fltrust_byz and _fltrust_byz == org_key:
+            role_label = "⚠ FLTrust-flagged"
             role_color = THEME["orange"]
         else:
             role_label = "✓ Normal"
@@ -726,7 +726,7 @@ st.markdown(f"""
       ⚙️ AURA · FL Server Console
     </span>
     <span style="color:{THEME['dim']}; margin-left:0.8em; font-size:0.82em">
-      Krum-Aggregated Federated Learning  ·  Blockchain-Audited
+      FLTrust-Aggregated Federated Learning  ·  Blockchain-Audited
     </span>
   </div>
   <div style="text-align:right">
@@ -747,8 +747,8 @@ metrics_ph = st.empty()
 with metrics_ph.container():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rounds Done",   f"0 / {rnd_total}")
-    c2.metric("Krum Selected", "— / 3")
-    c3.metric("Krum Dropped",  "—")
+    c2.metric("FLTrust trusted", "— / 3")
+    c3.metric("FLTrust flagged", "—")
     c4.metric("Status",        run_state)
 
 st.markdown("---")
@@ -788,7 +788,7 @@ for _ri, _org_k in enumerate(["hospital", "bank", "university"]):
 
     _byz_badge = (
         f"<span style='background:{THEME['yellow']};color:#000;border-radius:4px;"
-        f"padding:1px 6px;font-size:0.75em;margin-left:6px;'>⚡ Krum-flagged</span>"
+        f"padding:1px 6px;font-size:0.75em;margin-left:6px;'>⚡ FLTrust-flagged</span>"
         if _byz_last == _org_k else ""
     )
     with _rd_cols[_ri]:
@@ -805,8 +805,8 @@ for _ri, _org_k in enumerate(["hospital", "bank", "university"]):
 if _byz_last:
     st.markdown(
         f"<div style='color:{THEME['yellow']};font-size:0.85em;margin-bottom:8px'>"
-        f"⚡ Krum-flagged suspicious node last run: <b>{_byz_last.upper()}</b>"
-        f" — this client's update was a mathematical outlier and was dropped by aggregation."
+        f"⚡ FLTrust-flagged suspicious node last run: <b>{_byz_last.upper()}</b>"
+        f" — this client's gradient had low cosine trust vs the server root update and was down-weighted in aggregation."
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -857,7 +857,7 @@ with btn_col:
 with info_col:
     st.markdown(
         f"<div style='color:{THEME['dim']}; font-size:0.82em; padding-top:0.6rem'>"
-        f"3 clients  ·  {rnd_total} rounds  ·  Krum(n=3, keep=2)  "
+        f"3 clients  ·  {rnd_total} rounds  ·  FLTrust (cosine trust vs server root)  "
         f"·  1 blockchain mint (final round only)"
         f"</div>",
         unsafe_allow_html=True,

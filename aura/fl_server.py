@@ -6,8 +6,8 @@ This server implements two critical security properties:
 
 1. BYZANTINE ROBUSTNESS (FLTrust Aggregation — Upgrade 6)
    --------------------------------------------------------
-   Standard FedAvg is vulnerable to model poisoning. Krum guards against
-   it geometrically (distance-based) but has a critical flaw: it rejects
+   Standard FedAvg is vulnerable to model poisoning. Legacy Krum (distance-based;
+   see krum_select / krum_aggregate below) guards geometrically but has a critical flaw: it rejects
    clients whose updates are geometrically distant even if they are
    *honestly* trained on rare or skewed data distributions (e.g., a
    hospital with rare disease traffic).  This causes false-positive
@@ -26,10 +26,11 @@ This server implements two critical security properties:
 
    Key advantage: a hospital client with unusual-but-legitimate data has
    a gradient that still *points in the same direction* as improvement on
-   normal traffic. Krum would drop it; FLTrust keeps it with proportional
+   normal traffic. Legacy Krum would drop it; FLTrust keeps it with proportional
    trust.
 
-   Krum functions are retained as legacy code in case of rollback.
+   **Active aggregation:** FLTrust in aggregate_fit. **Legacy fallback only:**
+   krum_select / krum_aggregate (not used in the default path) retained for rollback or experiments.
 
 2. STRAGGLER TIMEOUT POLICY
    --------------------------
@@ -82,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Krum Aggregation Implementation
+# Legacy Krum aggregation (fallback only — not used by aggregate_fit; FLTrust is active)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def krum_select(
@@ -193,7 +194,7 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLTrust Aggregation (Upgrade 6 — replaces Krum in aggregate_fit)
+# FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fltrust_aggregate(
@@ -338,24 +339,22 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom Flower Strategy: KrumFedAURA
+# Custom Flower Strategy: KrumFedAURA (FLTrust inside aggregate_fit; Krum helpers are legacy)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KrumFedAURA(FedAvg):
     """
     Custom Flower aggregation strategy extending FedAvg with:
-      1. FLTrust Byzantine-robust aggregation (replaces Krum — Upgrade 6)
+      1. **FLTrust** Byzantine-robust aggregation (active — Upgrade 6; cosine trust vs server root).
       2. Straggler timeout + drop policy
       3. Per-round SHA-256 model hash logging
       4. Blockchain audit integration
 
-    Class name is intentionally kept as KrumFedAURA for backward compatibility
-    — all callers (dashboard, run.py, simulation) instantiate this class by
-    name and would require touching multiple files if renamed.
+    Class name remains **KrumFedAURA** for backward compatibility with dashboards and scripts.
+    **krum_select / krum_aggregate** exist only as legacy fallback code paths, not used by aggregate_fit.
 
-    Inheriting from FedAvg reuses all the Flower boilerplate (
-    sampling, evaluation scheduling, etc.) while overriding only
-    `aggregate_fit` where our security logic lives.
+    Inheriting from FedAvg reuses Flower boilerplate (sampling, evaluation scheduling, etc.)
+    while overriding `aggregate_fit` where FLTrust and audit logic live.
     """
 
     def __init__(
@@ -415,7 +414,7 @@ class KrumFedAURA(FedAvg):
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """
-        Override FedAvg's aggregate_fit to apply Krum instead of simple mean.
+        Override FedAvg's aggregate_fit to apply **FLTrust** (not plain FedAvg mean).
 
         Straggler Policy
         ----------------
@@ -676,7 +675,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
         active_orgs = ["hospital", "bank", "university"]
 
     # Attack is tied to the bank org — only injected if bank is in active_orgs.
-    # If bank is offline, all clients are honest (no meaningless Krum drop).
+    # If bank is offline, all clients are honest (no meaningless FLTrust flag).
     if "bank" in active_orgs:
         attack_arg = active_orgs.index("bank")
     else:
@@ -716,20 +715,20 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
             print(f"  [CLIENT {client.client_id}] weights sent to server ✓")
             fit_results.append((None, fit_res))   # ClientProxy=None in simulation
 
-        # Run server-side Krum + aggregation
+        # Run server-side FLTrust aggregation
         new_params, metrics = strategy.aggregate_fit(
             server_round = rnd,
             results      = fit_results,
             failures     = [],
         )
         # Build per-client status for dashboard display
-        # "Byzantine" = whoever Krum DROPPED (mathematical outlier detection)
+        # "Byzantine" = clients FLTrust flagged (low cosine trust vs server root)
         selected_idx = metrics.get("fltrust_trusted_indices", [])
         dropped_idx  = list(metrics.get("fltrust_flagged_indices", []))
         client_statuses = []
         for i, client in enumerate(clients):
             is_selected  = (selected_idx and i in selected_idx)
-            is_byzantine = (i in dropped_idx)   # dropped by Krum = suspicious
+            is_byzantine = (i in dropped_idx)   # FLTrust-flagged = suspicious
             org_key      = active_orgs[i] if i < len(active_orgs) else f"org_{i}"
             net_map      = {"hospital": "192.168.1.0/24",
                             "bank":     "10.0.1.0/24",

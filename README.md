@@ -13,7 +13,7 @@ AURA is a production-grade, privacy-preserving network intrusion detection syste
 - **GraphSAGE (Inductive GNN)** — models network topology as a graph; detects anomalies in traffic relationships, not just individual packet stats
 - **Flow Autoencoder** — reconstruction-error based anomaly scoring; learns what "normal" looks like and flags deviations
 - **EMA Dynamic Thresholding** — self-calibrating threshold using Exponential Moving Average (no hardcoded cutoffs)
-- **Federated Learning with Krum Aggregation** — multiple network segments train locally; only model weights are shared, never raw traffic (privacy-preserving)
+- **Federated Learning with FLTrust aggregation (Cao et al.)** — multiple network segments train locally; only model weights are shared, never raw traffic (privacy-preserving)
 - **Blockchain Audit Log** — every global model update is SHA-256 hashed and written immutably to ledger (tamper-evident supply-chain defence)
 - **3-Tier Automated Response** — LOG → THROTTLE → ISOLATE based on severity and node criticality
 
@@ -42,7 +42,7 @@ Raw Network Traffic (CICIDS2017)
               ▼
 ┌─────────────────────────────┐
 │  Phase 3: Federated Learn.  │  Flower (flwr) framework
-│  Krum Aggregation           │  Byzantine-fault tolerant (drops poisoned updates)
+│  FLTrust aggregation (Cao)  │  Trust-scored gradients; Byzantine clients score zero
 │  Straggler Timeout (30s)    │  Gradient clipping (norm=1.0)
 └─────────────┬───────────────┘
               │
@@ -76,7 +76,7 @@ NEXJEM/
 │   ├── detector.py          # EMA dynamic thresholding, cascade L1→L2
 │   ├── response_engine.py   # 3-tier policy engine, HITL, iptables simulation
 │   ├── fl_client.py         # Flower federated learning client
-│   ├── fl_server.py         # Krum aggregation, straggler policy
+│   ├── fl_server.py         # FLTrust aggregation, straggler policy
 │   ├── blockchain.py        # Web3 + local fallback audit logger
 │   └── attack_injector.py   # 5 attack profiles for red-team simulation
 ├── contracts/
@@ -169,7 +169,7 @@ python verify_chain.py
 | **GraphSAGE over GCN** | Inductive — detects threats on new/unseen nodes without retraining |
 | **Manual SAGEConv** | No torch_geometric dependency; implemented via `torch.scatter_add_` — more portable |
 | **EMA threshold over static** | Network baseline drifts (Monday ≠ Friday traffic) — adaptive 3σ detection |
-| **Krum aggregation** | Mathematically proven Byzantine-fault tolerance — filters poisoned model updates |
+| **FLTrust aggregation (Cao et al.)** | Trust-scored gradient aggregation — cosine similarity between client and server gradients; Byzantine clients score zero and contribute nothing to the global model |
 | **IsolationForest sanitisation** | Removes 2% extreme outliers from benign baseline before scaler fitting — prevents data poisoning |
 | **Never isolate critical infra** | Auto-isolating a Domain Controller is worse than the attack — HITL required |
 | **Blockchain for model hashes** | Supply-chain attack defence — detects silent model weight tampering |
