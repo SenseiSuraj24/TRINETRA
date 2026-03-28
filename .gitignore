@@ -12,6 +12,7 @@ env/
 # Large dataset CSVs (too big for GitHub)
 CSV's/
 *.csv
+*.zip
 
 # Saved models (binary, large)
 saved_models/*.pth
