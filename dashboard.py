@@ -33,6 +33,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
@@ -71,6 +72,11 @@ st.set_page_config(
     layout     = "wide",
     initial_sidebar_state = "expanded",
 )
+
+# Auto-refresh every DASHBOARD_REFRESH_INTERVAL_MS milliseconds.
+# This drives the pending_inject.json poll — without it, the node colour
+# can only update when the user manually clicks a button.
+st_autorefresh(interval=cfg.DASHBOARD_REFRESH_INTERVAL_MS, key="aura_autorefresh")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour Theme
