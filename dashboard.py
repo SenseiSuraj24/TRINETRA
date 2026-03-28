@@ -590,7 +590,13 @@ if _pending_path.exists():
                 triggered_nodes = [_pi_idx],
                 confidence      = _pi_conf,
                 raw_label_ratio = 0.0,
+                # Explainability fields — populated by last_explanation.json panel
+                # separately (Fix 2).  Provide required defaults here so the
+                # dataclass constructor doesn't raise TypeError silently.
+                top_features    = [],
                 inferred_attack = "Custom Injection",
+                match_score     = 0.0,
+                group_residuals = {},
             )
             if st.session_state.get("responder"):
                 _pi_records = st.session_state["responder"].act(_pi_event)

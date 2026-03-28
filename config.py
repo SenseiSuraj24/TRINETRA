@@ -124,6 +124,25 @@ KRUM_NUM_TO_SELECT  = 2          # Select 2 from 3 mock clients (drops 1 straggl
 FL_ROUND_TIMEOUT_SEC = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FLTRUST AGGREGATION (replaces Krum — Upgrade 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Number of synthetic benign samples the server holds as its trusted root dataset.
+# These are used to train the server model by one step each round so it computes
+# a reference gradient direction for cosine trust scoring of client updates.
+# Range: 100–500 recommended; lower = faster, higher = more robust server gradient.
+FLTRUST_ROOT_SAMPLES   = 200
+
+# Learning rate used for the server's single-step root-dataset gradient update.
+# Kept separate from AE_LEARNING_RATE so it can be tuned independently.
+FLTRUST_SERVER_LR      = 1e-3
+
+# Trust score at or below this value causes the client to be flagged as Byzantine
+# in the detection log (fed into Upgrade 3).  ReLU already zeroes negatives;
+# this threshold lets you also zero out near-zero trust scores from noisy clients.
+FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
 # ─────────────────────────────────────────────────────────────────────────────
 
