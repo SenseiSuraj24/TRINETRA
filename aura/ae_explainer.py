@@ -134,45 +134,44 @@ FEATURE_GROUPS: Dict[str, List[int]] = {
 
 ATTACK_SIGNATURES: Dict[str, Dict[int, float]] = {
     "DDoS": {
-        15: 1.0,   # Flow Packets/s — flood-level packet rate
-        14: 0.9,   # Flow Bytes/s   — high bandwidth
-        44: 0.85,  # SYN Flag Count — SYN flood, no ACK
-        47: 0.8,   # ACK Flag Count — low (incomplete handshakes)
-        16: 0.85,  # Flow IAT Mean  — near-zero inter-arrival (flood)
-        17: 0.6,   # Flow IAT Std   — robotic regularity
-        2:  0.75,  # Total Fwd Packets — overwhelming
+        15: 1.0,   # Flow Packets/s
+        14: 0.9,   # Flow Bytes/s
+        44: 0.8,   # SYN Flag Count
+        2:  0.8,   # Total Fwd Packets
+        16: 0.7,   # Flow IAT Mean
+        17: 0.7,   # Flow IAT Std
     },
     "Port Scan": {
-        45: 1.0,   # RST Flag Count  — port closed responses
-        44: 0.85,  # SYN Flag Count  — probe SYNs
-        1:  0.9,   # Flow Duration   — extremely short flows
-        4:  0.8,   # Total Fwd Bytes — minimal data (probes only)
-        5:  0.75,  # Total Bwd Bytes — minimal responses
-        14: 0.4,   # Flow Bytes/s    — low throughput
+        45: 1.0,   # RST Flag Count
+        44: 0.9,   # SYN Flag Count
+        1:  0.8,   # Flow Duration
+        4:  0.7,   # Total Fwd Bytes
+        5:  0.7,   # Total Bwd Bytes
+        14: 0.5,   # Flow Bytes/s
     },
     "Lateral Movement": {
-        17: 1.0,   # Flow IAT Std    — high jitter (evasion)
-        74: 0.95,  # Idle Mean       — beacon-like long pauses
-        75: 0.7,   # Idle Std        — robotic regularity in idle
-        46: 0.8,   # PSH Flag Count  — data bursts
-        1:  0.6,   # Flow Duration   — moderate-length flows
-        2:  0.55,  # Total Fwd Packets — moderate traffic
+        17: 1.0,   # Flow IAT Std
+        74: 0.9,   # Idle Mean
+        1:  0.8,   # Flow Duration
+        2:  0.7,   # Total Fwd Packets
+        75: 0.6,   # Idle Std
+        46: 0.5,   # PSH Flag Count
     },
     "Data Exfiltration": {
-        4:  1.0,   # Total Fwd Bytes     — large upstream (data leaving)
-        5:  0.9,   # Total Bwd Bytes     — near-zero downstream (nothing back)
-        63: 0.85,  # Subflow Fwd Bytes   — sustained outbound
-        65: 0.8,   # Subflow Bwd Bytes   — near-zero inbound subflow
-        16: 0.7,   # Flow IAT Mean       — regulated pacing
-        17: 0.85,  # Flow IAT Std        — robotic (machine-scripted timing)
-        1:  0.75,  # Flow Duration       — very long sustained connection
+        4:  1.0,   # Total Fwd Bytes
+        63: 0.9,   # Subflow Fwd Bytes
+        1:  0.8,   # Flow Duration
+        16: 0.7,   # Flow IAT Mean
+        17: 0.6,   # Flow IAT Std
+        5:  0.5,   # Total Bwd Bytes
+        65: 0.5,   # Subflow Bwd Bytes
     },
     "Web Attack": {
-        30: 1.0,   # Fwd PSH Flags       — HTTP request bursts
-        46: 0.9,   # PSH Flag Count      — push heavy
-        1:  0.7,   # Flow Duration       — short request-response cycles
-        4:  0.6,   # Total Fwd Bytes     — large request payloads (SQL payload)
-        47: 0.5,   # ACK Flag Count      — normal ACK pattern present
+        46: 1.0,   # PSH Flag Count
+        4:  0.9,   # Total Fwd Bytes
+        5:  0.8,   # Total Bwd Bytes
+        1:  0.7,   # Flow Duration
+        16: 0.6,   # Flow IAT Mean
     },
 }
 
@@ -268,7 +267,7 @@ ATTACK_EXPLANATIONS: Dict[str, Dict[str, str]] = {
 def explain_ae(
     residuals:  np.ndarray,   # [78] mean absolute per-feature residual
     top_k:      int = 5,
-    min_score:  float = 0.30, # minimum similarity to claim a match
+    min_score:  float = 0.05, # minimum similarity to claim a match
 ) -> Dict:
     """
     Given a per-feature reconstruction residual vector, return a structured
