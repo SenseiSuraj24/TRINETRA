@@ -1115,6 +1115,149 @@ with ctrl_atk:
     """
     _components.html(_inject_html, height=250, scrolling=False)
 
+    # ΓöÇΓöÇ Autoencoder Boundary Explorer ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    st.markdown("---")
+    st.markdown(f"<h4 style='color:{THEME['cyan']}'>≡ƒÄ¢∩╕Å Autoencoder Boundary Explorer</h4>", unsafe_allow_html=True)
+
+    @st.cache_resource
+    def load_explorer_ae():
+        path = getattr(cfg, "MODEL_SAVE_PATH", None)
+        if path is None:
+            path = cfg.MODELS_DIR / "autoencoder_best.pth"
+            if not path.exists():
+                path = cfg.MODELS_DIR / "aura_bundle.pth"
+        if not path.exists():
+            return None
+            
+        from aura.models import FlowAutoencoder, AURAModelBundle
+        if "bundle" in str(path):
+            bundle = AURAModelBundle()
+            bundle.load_state_dict(torch.load(path, map_location="cpu"))
+            ae = bundle.autoencoder
+        else:
+            ae = FlowAutoencoder()
+            ae.load_state_dict(torch.load(path, map_location="cpu"))
+        ae.eval()
+        return ae
+
+    ae_model = load_explorer_ae()
+    if ae_model is None:
+        st.warning("Model not trained yet ΓÇö run python run.py train first")
+    else:
+        ae_cols_1 = st.columns(3)
+        ae_cols_2 = st.columns(3)
+
+        val_flow_bytes = ae_cols_1[0].slider("flow_bytes_per_sec", 0.0, 1.0, 0.0)
+        val_fwd_pkt    = ae_cols_1[1].slider("fwd_packet_len_mean", 0.0, 1.0, 0.0)
+        val_bwd_pkt    = ae_cols_1[2].slider("bwd_packet_len_mean", 0.0, 1.0, 0.0)
+        
+        val_flow_iat   = ae_cols_2[0].slider("flow_iat_mean", 0.0, 1.0, 0.0)
+        val_syn        = ae_cols_2[1].slider("syn_flag_count", 0.0, 1.0, 0.0)
+        val_dst_port   = ae_cols_2[2].slider("dst_port", 0.0, 1.0, 0.0)
+
+        x_tensor = torch.zeros(cfg.FEATURE_DIM)
+            
+        name_map = {
+            "flow_bytes_per_sec": "flow_bytes_s",
+            "fwd_packet_len_mean": "fwd_pkt_len_mean",
+            "bwd_packet_len_mean": "bwd_pkt_len_mean",
+            "flow_iat_mean": "flow_iat_mean",
+            "syn_flag_count": "syn_flag_count",
+            "dst_port": "dest_port",
+        }
+        
+        for ui_name, val in [
+            ("flow_bytes_per_sec", val_flow_bytes),
+            ("fwd_packet_len_mean", val_fwd_pkt),
+            ("bwd_packet_len_mean", val_bwd_pkt),
+            ("flow_iat_mean", val_flow_iat),
+            ("syn_flag_count", val_syn),
+            ("dst_port", val_dst_port)
+        ]:
+            cfg_name = name_map.get(ui_name, ui_name)
+            idx = cfg.FEATURE_INDEX_MAP.get(cfg_name)
+            if idx is not None:
+                x_tensor[idx] = val
+
+        with torch.no_grad():
+            # Get modified reconstruction
+            x_hat, _ = ae_model(x_tensor.unsqueeze(0))
+            residuals = ((x_tensor.unsqueeze(0) - x_hat) ** 2).squeeze(0)
+            
+            # Calculate base zero reconstruction to cleanly isolate the slider impact
+            base_tensor = torch.zeros(cfg.FEATURE_DIM)
+            base_hat, _ = ae_model(base_tensor.unsqueeze(0))
+            base_res = ((base_tensor.unsqueeze(0) - base_hat) ** 2).squeeze(0)
+            
+            # Delta residual: how much worse it got by moving the sliders
+            delta_res = torch.relu(residuals - base_res)
+            
+            # Use delta_res for the feature explanations so they only target slider changes
+            mse = delta_res.mean().item() * 15.0  # Scale appropriate for limits
+            
+            # Replace 'residuals' passed to explainer with the true delta signal
+            residuals = delta_res
+
+        st.caption(f"AE baseline delta isolated ΓÇö simulated impact on network manifold")
+
+        if mse > cfg.MSE_THRESHOLD_HIGH:
+            status = "≡ƒö┤ ANOMALOUS"
+            mse_color = THEME["red"]
+        elif mse > cfg.MSE_THRESHOLD_MEDIUM:
+            status = "≡ƒƒí BORDERLINE"
+            mse_color = THEME["orange"]
+        else:
+            status = "≡ƒƒó NORMAL"
+            mse_color = THEME["green"]
+
+        st.markdown(
+            f"<div style='background:{THEME['panel']}; border:1px solid {mse_color}; "
+            f"border-radius:8px; padding:1rem; margin-top:1rem; text-align:center;'>"
+            f"<div style='font-size:1.2em; font-weight:bold; color:{THEME['text']}'>{status}</div>"
+            f"<div style='font-size:2.5em; font-weight:bold; color:{mse_color};'>{mse:.4f}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        try:
+            try:
+                from aura.ae_explainer import explain_anomaly as explain_func
+            except ImportError:
+                from aura.ae_explainer import explain_ae as explain_func
+            expl = explain_func(residuals.numpy())
+            top_5 = expl.get("top_features", [])[:5]
+            
+            if top_5:
+                if mse > cfg.MSE_THRESHOLD_MEDIUM:
+                    top_feature_name = top_5[0][0]  # name from explain_anomaly output
+                    explanations = {
+                        "flow_bytes_per_sec": "High data transfer rate detected ΓÇö consistent with data exfiltration or DDoS.",
+                        "Flow Bytes/s": "High data transfer rate detected ΓÇö consistent with data exfiltration or DDoS.",
+                        "fwd_packet_len_mean": "Unusual forward packet sizes observed ΓÇö potential payload injection.",
+                        "Fwd Pkt Len Mean": "Unusual forward packet sizes observed ΓÇö potential payload injection.",
+                        "bwd_packet_len_mean": "Abnormal backward packet sizes ΓÇö possible command-and-control (C2) instruction delivery.",
+                        "Bwd Pkt Len Mean": "Abnormal backward packet sizes ΓÇö possible command-and-control (C2) instruction delivery.",
+                        "flow_iat_mean": "Irregular inter-arrival times ΓÇö indicative of automated scanning or beaconing.",
+                        "Flow IAT Mean": "Irregular inter-arrival times ΓÇö indicative of automated scanning or beaconing.",
+                        "syn_flag_count": "Excessive SYN flags detected ΓÇö likely a SYN flood or aggressive port scan.",
+                        "SYN Flag Count": "Excessive SYN flags detected ΓÇö likely a SYN flood or aggressive port scan.",
+                        "dst_port": "Traffic aimed at unusual ports ΓÇö strong indicator of lateral movement.",
+                        "Destination Port": "Traffic aimed at unusual ports ΓÇö strong indicator of lateral movement."
+                    }
+                    st.info(explanations.get(top_feature_name, f"Unusual traffic pattern driven primarily by {top_feature_name}."))
+
+                import pandas as pd
+                chart_data = pd.DataFrame({
+                    "Feature": [f[0] for f in top_5],
+                    "Squared Error": [f[1] for f in top_5]
+                }).set_index("Feature")
+                
+                st.markdown(f"<div style='margin-top:1rem;'></div>", unsafe_allow_html=True)
+                st.bar_chart(chart_data)
+        except Exception as e:
+            st.error(f"Could not load explanation chart: {e}")
+
+
     if st.button("🟢 Generate Normal Traffic", use_container_width=True):
 
         st.session_state["attack_active"] = False
