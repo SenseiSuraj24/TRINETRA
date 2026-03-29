@@ -2,7 +2,7 @@
 
 > **Zero-Day Network Threat Detection using Graph Neural Networks, Federated Learning & Blockchain Audit**
 > 
-> Team Trinetra · NEXJEM Hackathon 2026
+> Team Trinetra · SPECTRE Hackathon 2026
 
 ---
 
@@ -79,7 +79,7 @@ Raw Network Traffic (CICIDS2017)
 ## Project Structure
 
 ```
-TRINETRA---NEXJEM/
+TRINETRA/
 ├── aura/
 │   ├── __init__.py
 │   ├── data_loader.py           # CICIDS2017 pipeline, IsolationForest sanitisation
@@ -133,8 +133,8 @@ Attack types covered: DDoS, Port Scan, Brute Force, Web Attacks (XSS, SQLi), Inf
 ### 1. Clone and set up environment
 
 ```bash
-git clone https://github.com/SenseiSuraj24/TRINETRA---NEXJEM.git
-cd TRINETRA---NEXJEM
+git clone https://github.com/SenseiSuraj24/TRINETRA.git
+cd TRINETRA
 python -m venv .venv
 
 # Windows
@@ -425,4 +425,4 @@ Because *W* is doubly stochastic, the network mathematically converges to the sa
 
 ## Team
 
-**Team Trinetra** · NEXJEM Hackathon 2026
+**Team Trinetra** · SPECTRE Hackathon 2026
